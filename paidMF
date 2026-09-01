@@ -4,16 +4,6 @@ local AllowedID = 5736206208
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local function SafetyCheck()
-    if LP.UserId ~= AllowedID then
-        LP:Kick("DYTON SECURITY: User Not Whitelisted. Access Revoked.")
-        return false
-    end
-    return true
-end
-
-if not SafetyCheck() then return end
-
 local servicesToVerify = {"MLModelDeliveryService", "PartyEmulatorService", "OmniRecommendationsService", "PlatformFriendsService"}
 for _, serviceName in ipairs(servicesToVerify) do
     local success = pcall(function()
