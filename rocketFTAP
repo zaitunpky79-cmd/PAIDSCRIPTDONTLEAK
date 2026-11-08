@@ -1,0 +1,932 @@
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- Re-run safe. The other toy scripts use the same toys, so unload them too.
+local env = (getgenv and getgenv()) or _G
+if env.FTAPRocketUnload then pcall(env.FTAPRocketUnload) end
+for _, k in ipairs({
+	"FTAPUfoUnload", "FTAPSusanooForm1Unload", "FTAPSusanooHalfUnload",
+	"FTAPSusanooUnload", "FTAPHandUnload", "FTAPSnakeUnload",
+}) do
+	if env[k] then pcall(env[k]) end
+end
+
+local MAX_TOYS = 20
+local V = Vector3.new
+local REST_H = 4.5 -- units from the rocket's center down to the bottom of the fins
+
+----------------------------------------------------------------
+-- State
+----------------------------------------------------------------
+local S = {
+	active = false,
+	busy = false,
+	dead = false,
+	state = "landed", -- landed | countdown | flying | landing
+	safe = true, -- indestructible protections
+	ride = false, -- stand on the nose (off = you stay on the ground)
+	skin = true, -- detailed local model
+	camFollow = true,
+	size = 6, -- studs per unit (the rocket is ~11 units tall)
+	speed = 60,
+	upHeld = false,
+	downHeld = false,
+	boostHeld = false,
+}
+local claimed = {} -- { part, bp, bg, si, oldCollide }
+local claimedSet = {}
+local heartbeat
+local conns = {}
+local skin = nil
+local camPart = nil
+local savedHum = nil
+local lastSubject = nil
+
+-- flight state
+local pos = Vector3.zero
+local vel = Vector3.zero
+local tiltVec = Vector3.zero
+local roll = 0
+local padPos = Vector3.zero
+local padGround = 0
+local cdT0 = 0
+local climbUntil = 0
+local intensity = 0 -- engine power 0..1.6
+local safeTimer, refillTimer, reclaimIdx = 0, 0, 0
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getRoot()
+	local char = lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local char = lp.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+----------------------------------------------------------------
+-- Toy layout: 20 slots (priority: middle of the body first)
+----------------------------------------------------------------
+local SL = {}
+for _, y in ipairs({ 0.5, -0.5, 1.5, -1.5, 2.5, -2.5 }) do
+	table.insert(SL, { k = "body", y = y })
+end
+for _, y in ipairs({ 3.6, 4.6, 5.5 }) do -- nose cone
+	table.insert(SL, { k = "body", y = y })
+end
+table.insert(SL, { k = "body", y = -3.3 }) -- engine
+table.insert(SL, { k = "win" })
+for i = 0, 3 do table.insert(SL, { k = "fin", a = i * math.pi / 2, r = 1.5, y = -2.2 }) end
+for i = 0, 3 do table.insert(SL, { k = "fin", a = i * math.pi / 2, r = 2.5, y = -3.0 }) end
+table.insert(SL, { k = "flame" })
+
+local function slotLocal(s, flick)
+	local k = s.k
+	if k == "body" then
+		return V(0, s.y, 0)
+	elseif k == "win" then
+		return V(0, 1.4, -1.0)
+	elseif k == "fin" then
+		return V(math.cos(s.a) * s.r, s.y, math.sin(s.a) * s.r)
+	else
+		return V(0, -4.4 - 0.9 * flick, 0)
+	end
+end
+
+----------------------------------------------------------------
+-- Toys
+----------------------------------------------------------------
+local function getToyFolder()
+	return workspace:FindFirstChild(lp.Name .. "SpawnedInToys")
+		or workspace:FindFirstChild("Ketik_Ketikketik4SpawnedInToys")
+end
+
+local function getToyParts()
+	local parts = {}
+	local folder = getToyFolder()
+	if not folder then return parts end
+	for _, toy in ipairs(folder:GetChildren()) do
+		local sp = toy:FindFirstChild("SoundPart")
+		if sp and sp:IsA("BasePart") then
+			table.insert(parts, sp)
+			if #parts >= MAX_TOYS then break end
+		end
+	end
+	return parts
+end
+
+local function claim(part)
+	-- The remote name/arguments may change when the game updates.
+	return pcall(function()
+		RS.GrabEvents.SetNetworkOwner:FireServer(part, part.CFrame)
+	end)
+end
+
+-- does this client still own the part? (executor helper; unknown = false)
+local function ownsPart(part)
+	if isnetworkowner then
+		local ok, r = pcall(isnetworkowner, part)
+		if ok then return r end
+	end
+	return false
+end
+
+local function makeMovers(c)
+	local part = c.part
+	if not (c.bp and c.bp.Parent == part) then
+		local bp = Instance.new("BodyPosition")
+		bp.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+		bp.P = 25000
+		bp.D = 1200
+		bp.Position = part.Position
+		bp.Parent = part
+		c.bp = bp
+	end
+	if not (c.bg and c.bg.Parent == part) then
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+		bg.P = 25000
+		bg.CFrame = part.CFrame
+		bg.Parent = part
+		c.bg = bg
+	end
+end
+
+local function addToy(part, si)
+	local c = { part = part, si = si, oldCollide = part.CanCollide }
+	part.CanCollide = false
+	makeMovers(c)
+	table.insert(claimed, c)
+	claimedSet[part] = c
+	return c
+end
+
+-- drop destroyed toys and pick up new ones to fill the free slots
+local function refill()
+	for i = #claimed, 1, -1 do
+		local c = claimed[i]
+		if not c.part.Parent then
+			claimedSet[c.part] = nil
+			table.remove(claimed, i)
+		end
+	end
+	if #claimed >= #SL then return end
+	local used = {}
+	for _, c in ipairs(claimed) do used[c.si] = true end
+	for _, part in ipairs(getToyParts()) do
+		if not claimedSet[part] then
+			local si
+			for i = 1, #SL do
+				if not used[i] then si = i break end
+			end
+			if not si then break end
+			if claim(part) then
+				used[si] = true
+				addToy(part, si)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- SKIN: detailed rocket (client-side parts, only you see them)
+----------------------------------------------------------------
+local function mk(parent, shape, size, cf, color, material, transparency)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Massless = true
+	p.CastShadow = false
+	if shape then p.Shape = shape end
+	p.Size = size
+	p.CFrame = cf
+	p.Color = color
+	p.Material = material
+	p.Transparency = transparency or 0
+	p.Parent = parent
+	return p
+end
+
+local function newModel(parent, name)
+	local m = Instance.new("Model")
+	m.Name = name
+	local root = mk(m, nil, V(0.2, 0.2, 0.2), CFrame.new(), Color3.new(), Enum.Material.SmoothPlastic, 1)
+	m.PrimaryPart = root
+	m.Parent = parent
+	return m
+end
+
+local function destroySkin()
+	if skin then
+		skin.model:Destroy()
+		skin = nil
+	end
+end
+
+local function newEmitter(parent, fire, sz)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.EmissionDirection = Enum.NormalId.Bottom
+	e.Rotation = NumberRange.new(0, 360)
+	if fire then
+		e.Lifetime = NumberRange.new(0.35, 0.7)
+		e.Speed = NumberRange.new(5 * sz, 9 * sz)
+		e.SpreadAngle = Vector2.new(6, 6)
+		e.Color = ColorSequence.new(Color3.fromRGB(255, 215, 90), Color3.fromRGB(255, 80, 20))
+		e.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.9 * sz),
+			NumberSequenceKeypoint.new(1, 0.15 * sz),
+		})
+		e.Transparency = NumberSequence.new(0.1, 1)
+		e.LightEmission = 1
+	else
+		e.Lifetime = NumberRange.new(1.8, 3.0)
+		e.Speed = NumberRange.new(1.5 * sz, 3.5 * sz)
+		e.SpreadAngle = Vector2.new(20, 20)
+		e.Color = ColorSequence.new(Color3.fromRGB(190, 190, 195), Color3.fromRGB(110, 110, 118))
+		e.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.8 * sz),
+			NumberSequenceKeypoint.new(1, 3.2 * sz),
+		})
+		e.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.45),
+			NumberSequenceKeypoint.new(1, 1),
+		})
+		e.LightEmission = 0
+	end
+	e.Parent = parent
+	return e
+end
+
+local function buildSkin()
+	destroySkin()
+	local sz = S.size
+	local model = Instance.new("Model")
+	model.Name = "RocketSkin"
+	skin = { model = model }
+
+	local WHITE = Color3.fromRGB(230, 233, 242)
+	local RED = Color3.fromRGB(205, 50, 50)
+	local DARK = Color3.fromRGB(60, 64, 78)
+	local up = CFrame.Angles(0, 0, math.pi / 2) -- cylinder axis -> up
+
+	local rocket = newModel(model, "Rocket")
+	local function cyl(y, dia, len, color, material, tr)
+		return mk(rocket, Enum.PartType.Cylinder, V(len * sz, dia * sz, dia * sz),
+			CFrame.new(0, y * sz, 0) * up, color, material, tr)
+	end
+
+	-- hull with bands
+	cyl(0, 1.9, 7.0, WHITE, Enum.Material.Metal)
+	cyl(2.6, 1.95, 0.5, RED, Enum.Material.Metal)
+	cyl(-2.6, 1.95, 0.5, DARK, Enum.Material.Metal)
+	cyl(-0.6, 1.93, 0.18, DARK, Enum.Material.Metal)
+
+	-- ogive nose cone (stacked, shrinking discs) + tip
+	for i, w in ipairs({ 1.8, 1.4, 1.0, 0.62, 0.28 }) do
+		cyl(3.75 + (i - 1) * 0.5, w, 0.55, RED, Enum.Material.Metal)
+	end
+	mk(rocket, Enum.PartType.Ball, V(0.3, 0.3, 0.3) * sz, CFrame.new(0, 6.0 * sz, 0), WHITE, Enum.Material.Metal)
+
+	-- portholes (both sides)
+	for _, zs in ipairs({ -1, 1 }) do
+		mk(rocket, Enum.PartType.Ball, V(0.95, 0.95, 0.3) * sz, CFrame.new(0, 1.3 * sz, zs * 0.9 * sz), DARK, Enum.Material.Metal)
+		mk(rocket, Enum.PartType.Ball, V(0.7, 0.7, 0.34) * sz, CFrame.new(0, 1.3 * sz, zs * 0.92 * sz),
+			Color3.fromRGB(130, 230, 255), Enum.Material.Neon, 0.2)
+	end
+
+	-- 4 fins
+	for i = 0, 3 do
+		mk(rocket, nil, V(1.6, 2.8, 0.16) * sz,
+			CFrame.Angles(0, i * math.pi / 2, 0) * CFrame.new(1.75 * sz, -3.1 * sz, 0),
+			RED, Enum.Material.Metal)
+	end
+
+	-- engine bell + glowing rim
+	cyl(-4.0, 1.2, 1.0, DARK, Enum.Material.Metal)
+	cyl(-4.5, 1.0, 0.18, Color3.fromRGB(255, 140, 50), Enum.Material.Neon)
+	skin.rocket = rocket
+
+	-- flame (resized every frame) + nozzle for the particles
+	skin.flameOuter = mk(model, Enum.PartType.Cylinder, V(1, 1, 1), CFrame.new(),
+		Color3.fromRGB(255, 120, 30), Enum.Material.Neon, 0.4)
+	skin.flameInner = mk(model, Enum.PartType.Cylinder, V(1, 1, 1), CFrame.new(),
+		Color3.fromRGB(255, 240, 150), Enum.Material.Neon, 0.15)
+	skin.glow = mk(model, Enum.PartType.Ball, V(1.2, 1.2, 1.2) * sz, CFrame.new(),
+		Color3.fromRGB(255, 160, 60), Enum.Material.Neon, 0.6)
+	skin.nozzle = mk(model, nil, V(0.5, 0.5, 0.5), CFrame.new(), Color3.new(), Enum.Material.SmoothPlastic, 1)
+	skin.fire = newEmitter(skin.nozzle, true, sz)
+	skin.smoke = newEmitter(skin.nozzle, false, sz)
+
+	-- launch pad (stays on the ground when the rocket leaves)
+	local function padDisc(dia, thick, y, color, material, tr)
+		mk(model, Enum.PartType.Cylinder, V(thick * sz, dia * sz, dia * sz),
+			CFrame.new(padPos.X, padGround + y * sz, padPos.Z) * up, color, material, tr)
+	end
+	padDisc(9.0, 0.15, 0.08, Color3.fromRGB(60, 64, 76), Enum.Material.Metal)
+	padDisc(7.2, 0.17, 0.09, Color3.fromRGB(255, 210, 60), Enum.Material.Neon, 0.3)
+	padDisc(6.6, 0.19, 0.10, Color3.fromRGB(45, 48, 60), Enum.Material.Metal)
+
+	-- outline so you can always find it, even far away or behind things
+	local hl = Instance.new("Highlight")
+	hl.Adornee = model
+	hl.FillTransparency = 1
+	hl.OutlineColor = Color3.fromRGB(255, 200, 120)
+	hl.OutlineTransparency = 0.25
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = model
+
+	model.Parent = workspace
+end
+
+----------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "FTAPRocketGui"
+gui.ResetOnSpawn = false
+local okParent = pcall(function()
+	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+local GUI_H = 286
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(200, GUI_H)
+main.Position = UDim2.new(0, 12, 0, 72)
+main.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -66, 0, 32)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Rocket Ship"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -32)
+body.Position = UDim2.fromOffset(0, 32)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 20)
+status.Position = UDim2.fromOffset(10, 2)
+status.BackgroundTransparency = 1
+status.Text = "Status: idle"
+status.TextColor3 = Color3.fromRGB(170, 170, 185)
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = body
+
+local function setStatus(t) status.Text = "Status: " .. t end
+
+local function makeButton(text, x, y, w, h, cb)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, h)
+	b.Position = UDim2.fromOffset(x, y)
+	b.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.Text = text
+	b.BorderSizePixel = 0
+	b.Parent = body
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+	b.MouseButton1Click:Connect(function() cb(b) end)
+	return b
+end
+
+local function makeLabel(text, x, y, w)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.fromOffset(w, 28)
+	l.Position = UDim2.fromOffset(x, y)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.Font = Enum.Font.Gotham
+	l.TextSize = 13
+	l.Parent = body
+	return l
+end
+
+local function makeHoldButton(text, x, y, w, h, setHeld)
+	local b = makeButton(text, x, y, w, h, function() end)
+	b.MouseButton1Down:Connect(function() setHeld(true) end)
+	b.MouseButton1Up:Connect(function() setHeld(false) end)
+	b.MouseLeave:Connect(function() setHeld(false) end)
+	return b
+end
+
+local buildBtn, launchBtn
+
+local function setState(s)
+	S.state = s
+	if launchBtn then
+		launchBtn.Text = (s == "landed") and "Launch" or ((s == "flying") and "Land" or "...")
+	end
+	if S.active then
+		setStatus(({
+			landed = "on the pad",
+			countdown = "countdown...",
+			flying = "flying",
+			landing = "landing...",
+		})[s])
+	end
+end
+
+----------------------------------------------------------------
+-- Control mode + camera
+----------------------------------------------------------------
+local function restoreHum()
+	if savedHum and savedHum.hum and savedHum.hum.Parent then
+		local h = savedHum.hum
+		h.WalkSpeed = savedHum.WalkSpeed
+		h.JumpPower = savedHum.JumpPower
+		h.JumpHeight = savedHum.JumpHeight
+	end
+	savedHum = nil
+end
+
+local function freezeHum(hum)
+	if savedHum and savedHum.hum == hum then return end
+	restoreHum()
+	savedHum = {
+		hum = hum,
+		WalkSpeed = hum.WalkSpeed,
+		JumpPower = hum.JumpPower,
+		JumpHeight = hum.JumpHeight,
+	}
+	hum.WalkSpeed = 0
+	hum.JumpPower = 0
+	hum.JumpHeight = 0
+end
+
+local function applyMode(hum)
+	local engaged = S.state ~= "landed"
+	-- walking is frozen while the rocket is yours to steer
+	if engaged then freezeHum(hum) else restoreHum() end
+
+	local want = hum
+	if engaged and camPart and S.camFollow and not S.ride then want = camPart end
+	if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+	if lastSubject ~= want then
+		cam.CameraSubject = want
+		lastSubject = want
+	end
+end
+
+----------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------
+local function clampMag(v, m)
+	if v.Magnitude > m then return v.Unit * m end
+	return v
+end
+
+local function step(dt)
+	local root, hum = getRoot(), getHum()
+	if not root or not hum then return end
+	local t = tick()
+	local sz = S.size
+
+	applyMode(hum)
+
+	-- ground below the rocket
+	local ignore = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ignore, folder) end
+	if skin then table.insert(ignore, skin.model) end
+	rayParams.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(V(pos.X, pos.Y + 300, pos.Z), V(0, -3000, 0), rayParams)
+	local groundY = hit and hit.Position.Y or padGround
+	local restY = groundY + REST_H * sz
+
+	local shake = V(0, 0, 0)
+
+	if S.state == "landed" then
+		vel = Vector3.zero
+		pos = V(padPos.X, restY, padPos.Z)
+		intensity = intensity * math.max(0, 1 - dt * 6)
+
+	elseif S.state == "countdown" then
+		local c = t - cdT0
+		vel = Vector3.zero
+		pos = V(padPos.X, restY, padPos.Z)
+		intensity = math.clamp(c / 3, 0, 1) * 0.95
+		local a = 0.04 + 0.12 * math.clamp(c / 3, 0, 1)
+		shake = V((math.random() - 0.5) * a, (math.random() - 0.5) * a, (math.random() - 0.5) * a) * sz
+		local left = math.ceil(3 - c)
+		if left >= 1 then
+			setStatus("liftoff in " .. left)
+		end
+		if c >= 3 then
+			setState("flying")
+			vel = V(0, S.speed * 0.9, 0)
+			climbUntil = t + 2.5
+		end
+
+	elseif S.state == "flying" then
+		local md = hum.MoveDirection
+		local boost = S.boostHeld and 2 or 1
+		local v = (S.upHeld and 1 or 0) - (S.downHeld and 1 or 0)
+		local targetVy = v * S.speed * 0.7 * boost
+		if t < climbUntil then targetVy = math.max(targetVy, S.speed) end
+		local target = V(md.X * S.speed * boost, targetVy, md.Z * S.speed * boost)
+		vel = vel:Lerp(target, 1 - math.exp(-dt * 1.6))
+		local h = V(vel.X, 0, vel.Z).Magnitude / (S.speed * 2)
+		intensity = math.clamp(0.45 + 0.4 * h + (v > 0 and 0.25 or 0) + (S.boostHeld and 0.4 or 0), 0, 1.6)
+		pos += vel * dt
+		if pos.Y < restY then
+			pos = V(pos.X, restY, pos.Z)
+			vel = V(vel.X, math.max(vel.Y, 0), vel.Z)
+		end
+
+	else -- landing: slow descent straight down
+		local alt = pos.Y - restY
+		local descend = -math.clamp(alt * 0.6, 8, S.speed * 0.6)
+		vel = vel:Lerp(V(0, descend, 0), 1 - math.exp(-dt * 2))
+		intensity = 0.55
+		pos += vel * dt
+		if alt <= 0.6 then
+			pos = V(pos.X, restY, pos.Z)
+			padPos = V(pos.X, padPos.Y, pos.Z)
+			padGround = groundY
+			setState("landed")
+		end
+	end
+
+	-- indestructible: never fall into the void
+	if S.safe then
+		local floor = workspace.FallenPartsDestroyHeight + 100
+		if pos.Y < floor then
+			pos = V(pos.X, floor, pos.Z)
+			vel = V(vel.X, math.max(vel.Y, 0), vel.Z)
+		end
+	end
+
+	-- lean into the direction of travel; slowly spin while the engine runs
+	local hv = V(vel.X, 0, vel.Z)
+	local goalTilt = clampMag(hv / (S.speed * 2), 1)
+	if S.state == "landed" or S.state == "countdown" then goalTilt = V(0, 0, 0) end
+	tiltVec = tiltVec:Lerp(goalTilt, 1 - math.exp(-dt * 5))
+	local tilt = CFrame.new()
+	if tiltVec.Magnitude > 0.01 then
+		local axis = Vector3.yAxis:Cross(tiltVec.Unit)
+		tilt = CFrame.fromAxisAngle(axis, tiltVec.Magnitude * math.rad(40))
+	end
+	if S.state == "flying" or S.state == "landing" then roll += dt * 0.5 end
+	local bodyCF = CFrame.new(pos + shake) * tilt * CFrame.Angles(0, roll, 0)
+
+	-- camera anchor
+	if camPart then camPart.CFrame = CFrame.new(bodyCF.Position) end
+
+	-- ride on the nose (optional)
+	if S.ride then
+		local seat = bodyCF:PointToWorldSpace(V(0, 6.0 * sz + 3, 0))
+		root.CFrame = CFrame.new(seat) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	-- flame flicker
+	local flick = intensity * (0.82 + 0.18 * math.sin(t * 40) + 0.08 * math.random())
+
+	-- detailed skin
+	if S.skin and skin then
+		skin.rocket:PivotTo(bodyCF)
+		skin.nozzle.CFrame = bodyCF * CFrame.new(0, -4.5 * sz, 0)
+		local L = 0.4 + 2.2 * flick
+		local on = flick > 0.05
+		local sideways = CFrame.Angles(0, 0, math.pi / 2)
+		skin.flameOuter.Transparency = on and 0.4 or 1
+		skin.flameInner.Transparency = on and 0.15 or 1
+		skin.glow.Transparency = on and 0.6 or 1
+		skin.flameOuter.Size = V(L * sz, 0.95 * sz, 0.95 * sz)
+		skin.flameOuter.CFrame = bodyCF * CFrame.new(0, -(4.5 + L / 2) * sz, 0) * sideways
+		skin.flameInner.Size = V(L * 0.75 * sz, 0.5 * sz, 0.5 * sz)
+		skin.flameInner.CFrame = bodyCF * CFrame.new(0, -(4.5 + L * 0.75 / 2) * sz, 0) * sideways
+		skin.glow.CFrame = bodyCF * CFrame.new(0, -4.55 * sz, 0)
+		skin.fire.Rate = on and (40 + flick * 80) or 0
+		-- smoke also pours out on the pad, so liftoff looks right
+		local low = (pos.Y - groundY) < 25 * sz
+		skin.smoke.Rate = (flick > 0.1 and low) and (20 + flick * 60) or ((flick > 0.1) and 10 or 0)
+	end
+
+	-- indestructible upkeep: one toy re-claimed every 0.1 s, refill every 1.5 s
+	if S.safe then
+		safeTimer += dt
+		if safeTimer >= 0.1 and #claimed > 0 then
+			safeTimer = 0			reclaimIdx = reclaimIdx % #claimed + 1
+			local c = claimed[reclaimIdx]
+			if c.part.Parent then
+				if not ownsPart(c.part) then claim(c.part) end
+				c.part.CanCollide = false
+			end
+		end
+		refillTimer += dt
+		if refillTimer >= 1.5 then
+			refillTimer = 0
+			refill()
+		end
+	end
+
+	-- toys form the rocket
+	local rot = bodyCF.Rotation
+	for _, c in ipairs(claimed) do
+		local part = c.part
+		if part.Parent then
+			local target = bodyCF:PointToWorldSpace(slotLocal(SL[c.si], flick) * sz)
+			if S.safe then
+				makeMovers(c) -- rebuild movers if something removed them
+				local lv = part.AssemblyLinearVelocity
+				if lv.Magnitude > S.speed * 3 + 250 then -- flung: stop it
+					part.AssemblyLinearVelocity = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+				end
+				if (part.Position - target).Magnitude > 300 then -- thrown away: pull it back
+					part.CFrame = CFrame.new(target)
+				end
+			end
+			c.bp.Position = target
+			c.bg.CFrame = rot
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Summon / release
+----------------------------------------------------------------
+local function release()
+	S.active = false
+	if heartbeat then heartbeat:Disconnect() heartbeat = nil end
+	for _, c in ipairs(claimed) do
+		if c.bp then c.bp:Destroy() end
+		if c.bg then c.bg:Destroy() end
+		if c.part and c.part.Parent then c.part.CanCollide = c.oldCollide end
+	end
+	claimed = {}
+	claimedSet = {}
+	destroySkin()
+	restoreHum()
+	cam.CameraType = Enum.CameraType.Custom
+	local hum = getHum()
+	if hum then cam.CameraSubject = hum end
+	lastSubject = nil
+	if camPart then camPart:Destroy() camPart = nil end
+	S.state = "landed"
+	if launchBtn then launchBtn.Text = "Launch" end
+	if buildBtn then buildBtn.Text = "Summon Rocket" end
+	setStatus("released")
+end
+
+local function build()
+	if S.busy or S.active then return end
+	local root = getRoot()
+	if not root then setStatus("no character") return end
+
+	local parts = getToyParts()
+	if #parts == 0 then setStatus("no toys found") return end
+
+	S.busy = true
+	setStatus("claiming toys...")
+	local origin = root.CFrame
+	local teleported = false
+
+	for i = 1, math.min(#SL, #parts) do
+		local part = parts[i]
+		if part.Parent then
+			-- only move if the toy is out of grab range
+			if (part.Position - root.Position).Magnitude > 30 then
+				root.CFrame = part.CFrame * CFrame.new(0, 4, 0)
+				teleported = true
+				task.wait(0.08)
+			end
+			if claim(part) then
+				addToy(part, #claimed + 1)
+			end
+		end
+	end
+	if teleported then root.CFrame = origin end
+
+	if #claimed == 0 then
+		S.busy = false
+		setStatus("no toys claimed")
+		return
+	end
+
+	-- launch pad: ahead of you, on the ground
+	local look = root.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 1e-3 and flat.Unit or V(0, 0, -1)
+	local spot = root.Position + flat * (S.size * 9)
+	local ign = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ign, folder) end
+	rayParams.FilterDescendantsInstances = ign
+	local hit = workspace:Raycast(V(spot.X, root.Position.Y + 20, spot.Z), V(0, -500, 0), rayParams)
+	padGround = hit and hit.Position.Y or (root.Position.Y - 3)
+	padPos = V(spot.X, padGround, spot.Z)
+
+	pos = V(padPos.X, padGround + REST_H * S.size, padPos.Z)
+	vel = Vector3.zero
+	tiltVec = Vector3.zero
+	roll = 0
+	intensity = 0
+
+	camPart = Instance.new("Part")
+	camPart.Name = "RocketCam"
+	camPart.Anchored = true
+	camPart.CanCollide = false
+	camPart.CanQuery = false
+	camPart.CanTouch = false
+	camPart.Transparency = 1
+	camPart.Size = V(1, 1, 1)
+	camPart.CFrame = CFrame.new(pos)
+	camPart.Parent = workspace
+
+	if S.skin then buildSkin() end
+
+	S.active = true
+	buildBtn.Text = "Dismiss Rocket"
+	setState("landed")
+	heartbeat = RunService.Heartbeat:Connect(step)
+	S.busy = false
+end
+
+----------------------------------------------------------------
+-- Controls
+----------------------------------------------------------------
+buildBtn = makeButton("Summon Rocket", 10, 24, 180, 30, function()
+	if S.active then release() else task.spawn(build) end
+end)
+
+launchBtn = makeButton("Launch", 10, 58, 88, 30, function()
+	if not S.active then return end
+	if S.state == "landed" then
+		cdT0 = tick()
+		setState("countdown")
+	elseif S.state == "flying" then
+		setState("landing")
+	end
+end)
+launchBtn.BackgroundColor3 = Color3.fromRGB(190, 70, 60)
+
+makeHoldButton("🔥 Boost", 102, 58, 88, 30, function(h) S.boostHeld = h end)
+
+makeHoldButton("▲ Up", 10, 92, 88, 28, function(h) S.upHeld = h end)
+makeHoldButton("▼ Down", 102, 92, 88, 28, function(h) S.downHeld = h end)
+
+local speedLabel = makeLabel("Speed: 60", 10, 124, 90)
+makeButton("-", 104, 124, 40, 28, function()
+	S.speed = math.max(20, S.speed - 10)
+	speedLabel.Text = "Speed: " .. S.speed
+end)
+makeButton("+", 150, 124, 40, 28, function()
+	S.speed = math.min(250, S.speed + 10)
+	speedLabel.Text = "Speed: " .. S.speed
+end)
+
+local sizeLabel = makeLabel("Size: 6", 10, 154, 90)
+local function changeSize(delta)
+	S.size = math.clamp(S.size + delta, 3, 12)
+	sizeLabel.Text = "Size: " .. S.size
+	if S.active and S.skin then buildSkin() end -- rebuilt at the new size
+end
+makeButton("-", 104, 154, 40, 28, function() changeSize(-1) end)
+makeButton("+", 150, 154, 40, 28, function() changeSize(1) end)
+
+makeButton("Ride: OFF", 10, 186, 88, 28, function(b)
+	S.ride = not S.ride
+	b.Text = "Ride: " .. (S.ride and "ON" or "OFF")
+end)
+makeButton("Cam: Follow", 102, 186, 88, 28, function(b)
+	S.camFollow = not S.camFollow
+	b.Text = "Cam: " .. (S.camFollow and "Follow" or "Me")
+end)
+
+makeButton("Skin: ON", 10, 218, 88, 28, function(b)
+	S.skin = not S.skin
+	b.Text = "Skin: " .. (S.skin and "ON" or "OFF")
+	if S.active then
+		if S.skin then buildSkin() else destroySkin() end
+	end
+end)
+makeButton("Safe: ON", 102, 218, 88, 28, function(b)
+	S.safe = not S.safe
+	b.Text = "Safe: " .. (S.safe and "ON" or "OFF")
+	b.BackgroundColor3 = S.safe and Color3.fromRGB(60, 130, 80) or Color3.fromRGB(52, 52, 66)
+end).BackgroundColor3 = Color3.fromRGB(60, 130, 80)
+
+-- PC keys: Space = up, Shift = down, B = boost, L = launch / land
+table.insert(conns, UIS.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.Space then S.upHeld = true
+	elseif k == Enum.KeyCode.LeftShift then S.downHeld = true
+	elseif k == Enum.KeyCode.B then S.boostHeld = true
+	elseif k == Enum.KeyCode.L and S.active then
+		if S.state == "landed" then
+			cdT0 = tick()
+			setState("countdown")
+		elseif S.state == "flying" then
+			setState("landing")
+		end
+	end
+end))
+table.insert(conns, UIS.InputEnded:Connect(function(input)
+	local k = input.KeyCode
+	if k == Enum.KeyCode.Space then S.upHeld = false
+	elseif k == Enum.KeyCode.LeftShift then S.downHeld = false
+	elseif k == Enum.KeyCode.B then S.boostHeld = false end
+end))
+
+-- Close / unload
+local function unload()
+	S.dead = true
+	release()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+	if gui then gui:Destroy() end
+	env.FTAPRocketUnload = nil
+end
+env.FTAPRocketUnload = unload
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(24, 24)
+close.Position = UDim2.new(1, -30, 0, 4)
+close.BackgroundColor3 = Color3.fromRGB(150, 50, 50)
+close.Text = "X"
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 12
+close.BorderSizePixel = 0
+close.Parent = main
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+close.MouseButton1Click:Connect(unload)
+
+local mini = Instance.new("TextButton")
+mini.Size = UDim2.fromOffset(24, 24)
+mini.Position = UDim2.new(1, -58, 0, 4)
+mini.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+mini.Text = "-"
+mini.TextColor3 = Color3.new(1, 1, 1)
+mini.Font = Enum.Font.GothamBold
+mini.TextSize = 14
+mini.BorderSizePixel = 0
+mini.Parent = main
+Instance.new("UICorner", mini).CornerRadius = UDim.new(0, 6)
+local minimized = false
+mini.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	main.Size = minimized and UDim2.fromOffset(200, 32) or UDim2.fromOffset(200, GUI_H)
+	mini.Text = minimized and "+" or "-"
+end)
+
+-- Dragging (kept on screen)
+do
+	local dragging, dragStart, startPos
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			local vp = gui.AbsoluteSize
+			local nx = math.clamp(startPos.X.Offset + d.X, 0, math.max(0, vp.X - main.AbsoluteSize.X))
+			local ny = math.clamp(startPos.Y.Offset + d.Y, 0, math.max(0, vp.Y - 40))
+			main.Position = UDim2.new(0, nx, 0, ny)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end
