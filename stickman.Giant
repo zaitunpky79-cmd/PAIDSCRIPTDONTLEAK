@@ -1,0 +1,1323 @@
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- Re-run safe. The other toy scripts use the same toys, so unload them too.
+local env = (getgenv and getgenv()) or _G
+if env.FTAPStickmanUnload then pcall(env.FTAPStickmanUnload) end
+for _, k in ipairs({
+	"FTAPRocketUnload", "FTAPUfoUnload", "FTAPSusanooForm1Unload",
+	"FTAPSusanooHalfUnload", "FTAPSusanooUnload", "FTAPHandUnload", "FTAPSnakeUnload",
+}) do
+	if env[k] then pcall(env[k]) end
+end
+
+local MAX_TOYS = 20
+local TAU = math.pi * 2
+local V = Vector3.new
+
+-- rig (units)
+local LEG, ARM, TORSO = 1.8, 1.55, 3.0 -- each bone of the leg / arm, spine length
+local HIP_W, SH_W, HIP_Y0 = 0.65, 1.0, 3.45
+local TURN = 7 -- how fast it turns toward the joystick (rad/s)
+local AFK_TIME = 60 -- seconds before it sits down by itself
+
+----------------------------------------------------------------
+-- State
+----------------------------------------------------------------
+local S = {
+	active = false,
+	busy = false,
+	dead = false,
+	mode = "bare", -- bare | sword
+	run = false,
+	runHeld = false,
+	avatar = true, -- your avatar stays at the stickman's feet
+	camFollow = true,
+	skin = true,
+	safe = true,
+	size = 8, -- studs per unit (about 6.5 units tall)
+	speedMul = 1,
+	emote = nil, -- nil | "sit" | "dance"
+	attack = nil, -- { name, fn, dur, t0, fired, side, var }
+}
+local claimed, claimedSet = {}, {}
+local heartbeat
+local conns = {}
+local skin, camPart
+local savedHum, lastSubject, origZoom
+local fxList = {}
+
+-- motion state
+local pos = Vector3.zero
+local yaw = 0
+local speedNow, runBlend = 0, 0
+local phase = 0
+local swordT = 0 -- 0 = on the back, 1 = in the hand
+local sitW, danceW = 0, 0
+local lastInput = tick()
+local punchSide, slashVar = -1, 2
+local safeTimer, refillTimer, reclaimIdx = 0, 0, 0
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getRoot()
+	local char = lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local char = lp.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+----------------------------------------------------------------
+-- Math helpers
+----------------------------------------------------------------
+local function lerp(a, b, t) return a + (b - a) * t end
+
+local function smooth(x)
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
+
+-- keyframe track: keys = { {p, value}, ... } (numbers or Vector3), smooth between
+local function track(p, keys)
+	if p <= keys[1][1] then return keys[1][2] end
+	for i = 2, #keys do
+		if p <= keys[i][1] then
+			local a, b = keys[i - 1], keys[i]
+			local k = smooth((p - a[1]) / (b[1] - a[1]))
+			if typeof(a[2]) == "Vector3" then return a[2]:Lerp(b[2], k) end
+			return a[2] + (b[2] - a[2]) * k
+		end
+	end
+	return keys[#keys][2]
+end
+
+-- forward speed (studs/s) that moves the body D studs between p=a0 and p=b0
+local function moveProfile(p, a0, b0, D, dur)
+	if p <= a0 or p >= b0 then return 0 end
+	local x = (p - a0) / (b0 - a0)
+	return D * 6 * x * (1 - x) / ((b0 - a0) * dur)
+end
+
+-- two-bone IK: elbow/knee position (both bones have length L)
+local function ik(s, w, pole, L)
+	local d = w - s
+	local dist = d.Magnitude
+	if dist < 1e-3 then return s end
+	local dir = d / dist
+	local mid = (s + w) / 2
+	local h = 0
+	if dist < 2 * L then h = math.sqrt(L * L - (dist / 2) ^ 2) end
+	local perp = pole - dir * pole:Dot(dir)
+	if perp.Magnitude < 1e-3 then return mid end
+	return mid + perp.Unit * h
+end
+
+local function clampReach(sh, target, maxLen)
+	local d = target - sh
+	local m = d.Magnitude
+	if m > maxLen then return sh + d / m * maxLen end
+	return target
+end
+
+----------------------------------------------------------------
+-- Toys
+----------------------------------------------------------------
+-- which joint each toy follows (priority order)
+local SLOTKEYS = {
+	"pelvis", "spineMid", "chest", "neck", "spineLow",
+	"shL", "shR", "elbL", "elbR", "handL", "handR",
+	"kneeL", "kneeR", "ankL", "ankR", "toeL", "toeR",
+	"swordHilt", "swordMid", "swordTip",
+}
+
+local function getToyFolder()
+	return workspace:FindFirstChild(lp.Name .. "SpawnedInToys")
+		or workspace:FindFirstChild("Ketik_Ketikketik4SpawnedInToys")
+end
+
+local function getToyParts()
+	local parts = {}
+	local folder = getToyFolder()
+	if not folder then return parts end
+	for _, toy in ipairs(folder:GetChildren()) do
+		local sp = toy:FindFirstChild("SoundPart")
+		if sp and sp:IsA("BasePart") then
+			table.insert(parts, sp)
+			if #parts >= MAX_TOYS then break end
+		end
+	end
+	return parts
+end
+
+local function claim(part)
+	-- The remote name/arguments may change when the game updates.
+	return pcall(function()
+		RS.GrabEvents.SetNetworkOwner:FireServer(part, part.CFrame)
+	end)
+end
+
+local function ownsPart(part)
+	if isnetworkowner then
+		local ok, r = pcall(isnetworkowner, part)
+		if ok then return r end
+	end
+	return false
+end
+
+local function makeMovers(c)
+	local part = c.part
+	if not (c.bp and c.bp.Parent == part) then
+		local bp = Instance.new("BodyPosition")
+		bp.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+		bp.P = 25000
+		bp.D = 1200
+		bp.Position = part.Position
+		bp.Parent = part
+		c.bp = bp
+	end
+	if not (c.bg and c.bg.Parent == part) then
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+		bg.P = 25000
+		bg.CFrame = part.CFrame
+		bg.Parent = part
+		c.bg = bg
+	end
+end
+
+local function addToy(part, si)
+	local c = { part = part, si = si, oldCollide = part.CanCollide }
+	part.CanCollide = false
+	makeMovers(c)
+	table.insert(claimed, c)
+	claimedSet[part] = c
+	return c
+end
+
+local function refill()
+	for i = #claimed, 1, -1 do
+		local c = claimed[i]
+		if not c.part.Parent then
+			claimedSet[c.part] = nil
+			table.remove(claimed, i)
+		end
+	end
+	if #claimed >= #SLOTKEYS then return end
+	local used = {}
+	for _, c in ipairs(claimed) do used[c.si] = true end
+	for _, part in ipairs(getToyParts()) do
+		if not claimedSet[part] then
+			local si
+			for i = 1, #SLOTKEYS do
+				if not used[i] then si = i break end
+			end
+			if not si then break end
+			if claim(part) then
+				used[si] = true
+				addToy(part, si)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- SKIN: detailed stickman (client-side parts, only you see them)
+----------------------------------------------------------------
+local BODY_COLOR = Color3.fromRGB(18, 18, 22)
+
+local function mk(parent, shape, size, cf, color, material, transparency)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Massless = true
+	p.CastShadow = false
+	if shape then p.Shape = shape end
+	p.Size = size
+	p.CFrame = cf
+	p.Color = color
+	p.Material = material
+	p.Transparency = transparency or 0
+	p.Parent = parent
+	return p
+end
+
+local function newModel(parent, name)
+	local m = Instance.new("Model")
+	m.Name = name
+	local root = mk(m, nil, V(0.2, 0.2, 0.2), CFrame.new(), Color3.new(), Enum.Material.SmoothPlastic, 1)
+	m.PrimaryPart = root
+	m.Parent = parent
+	return m
+end
+
+local function limb(parent)
+	return mk(parent, Enum.PartType.Cylinder, V(1, 1, 1), CFrame.new(), BODY_COLOR, Enum.Material.SmoothPlastic)
+end
+
+local function ball(parent)
+	return mk(parent, Enum.PartType.Ball, V(1, 1, 1), CFrame.new(), BODY_COLOR, Enum.Material.SmoothPlastic)
+end
+
+-- a cylinder stretched between two points
+local function placeCyl(part, a, b, dia)
+	local d = b - a
+	local len = d.Magnitude
+	if len < 1e-3 then
+		part.Size = V(0.05, dia, dia)
+		part.CFrame = CFrame.new(a)
+		return
+	end
+	local dir = d / len
+	local up = math.abs(dir.Y) > 0.95 and Vector3.xAxis or Vector3.yAxis
+	part.Size = V(len, dia, dia)
+	part.CFrame = CFrame.lookAt((a + b) / 2, b, up) * CFrame.Angles(0, math.pi / 2, 0)
+end
+
+local function setBall(part, p, d)
+	part.Size = V(d, d, d)
+	part.CFrame = CFrame.new(p)
+end
+
+local function newTrail(part, p0, p1, color, life)
+	local a0 = Instance.new("Attachment")
+	a0.Position = p0
+	a0.Parent = part
+	local a1 = Instance.new("Attachment")
+	a1.Position = p1
+	a1.Parent = part
+	local tr = Instance.new("Trail")
+	tr.Attachment0 = a0
+	tr.Attachment1 = a1
+	tr.Lifetime = life or 0.3
+	tr.Color = ColorSequence.new(color)
+	tr.Transparency = NumberSequence.new(0.1, 1)
+	tr.LightEmission = 1
+	tr.FaceCamera = true
+	tr.Enabled = false
+	tr.Parent = part
+	return tr
+end
+
+local function buildSword(parent, sz)
+	local m = newModel(parent, "Sword")
+	-- the grip is the origin; the blade points to -Z
+	mk(m, Enum.PartType.Cylinder, V(0.9 * sz, 0.17 * sz, 0.17 * sz),
+		CFrame.new(0, 0, 0.45 * sz) * CFrame.Angles(0, math.pi / 2, 0),
+		Color3.fromRGB(95, 60, 35), Enum.Material.SmoothPlastic)
+	mk(m, Enum.PartType.Ball, V(0.3, 0.3, 0.3) * sz, CFrame.new(0, 0, 0.95 * sz),
+		Color3.fromRGB(215, 175, 70), Enum.Material.Metal)
+	mk(m, nil, V(1.1, 0.14, 0.22) * sz, CFrame.new(0, 0, -0.05 * sz),
+		Color3.fromRGB(215, 175, 70), Enum.Material.Metal)
+	local blade = mk(m, nil, V(0.42, 0.09, 4.2) * sz, CFrame.new(0, 0, -2.15 * sz),
+		Color3.fromRGB(215, 225, 240), Enum.Material.Metal)
+	mk(m, nil, V(0.14, 0.12, 4.0) * sz, CFrame.new(0, 0, -2.15 * sz),
+		Color3.fromRGB(120, 230, 255), Enum.Material.Neon, 0.2)
+	local trail = newTrail(blade, V(0, 0, 1.8 * sz), V(0, 0, -2.1 * sz), Color3.fromRGB(150, 235, 255), 0.35)
+	return { model = m, trail = trail }
+end
+
+local function destroySkin()
+	if skin then
+		skin.model:Destroy()
+		skin = nil
+	end
+	for _, f in ipairs(fxList) do
+		if f.part then f.part:Destroy() end
+	end
+	fxList = {}
+end
+
+local function buildSkin()
+	destroySkin()
+	local sz = S.size
+	local model = Instance.new("Model")
+	model.Name = "StickmanSkin"
+	skin = { model = model }
+
+	skin.torso = limb(model)
+	skin.pelvisB = ball(model)
+	skin.neckB = ball(model)
+	skin.shBar = limb(model)
+	skin.hipBar = limb(model)
+	for _, side in ipairs({ "L", "R" }) do
+		local arm = {
+			up = limb(model), fore = limb(model),
+			sh = ball(model), el = ball(model), hand = ball(model),
+		}
+		arm.trail = newTrail(arm.hand, V(0, 0.45 * sz, 0), V(0, -0.45 * sz, 0), Color3.fromRGB(255, 255, 255), 0.3)
+		skin["arm" .. side] = arm
+		skin["leg" .. side] = {
+			up = limb(model), low = limb(model), foot = limb(model),
+			hip = ball(model), knee = ball(model), ank = ball(model), toe = ball(model),
+		}
+	end
+	skin.sword = buildSword(model, sz)
+
+	-- white outline: the classic stickman look, visible through walls
+	local hl = Instance.new("Highlight")
+	hl.Adornee = model
+	hl.FillTransparency = 1 -- outline only, so the sword and rings keep their colors
+	hl.OutlineColor = Color3.new(1, 1, 1)
+	hl.OutlineTransparency = 0.1
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = model
+
+	model.Parent = workspace
+end
+
+-- expanding shockwave ring on the ground
+local function spawnRing(center, maxR, color, dur)
+	if not skin then return end
+	local sz = S.size
+	local part = mk(skin.model, Enum.PartType.Cylinder, V(0.2 * sz, 1, 1),
+		CFrame.new(center) * CFrame.Angles(0, 0, math.pi / 2), color, Enum.Material.Neon, 0.2)
+	table.insert(fxList, { part = part, t0 = tick(), dur = dur, maxR = maxR, center = center, startR = 0.5 * sz })
+end
+
+local function updateFx()
+	local now = tick()
+	local sz = S.size
+	for i = #fxList, 1, -1 do
+		local f = fxList[i]
+		local k = (now - f.t0) / f.dur
+		if k >= 1 or not f.part.Parent then
+			f.part:Destroy()
+			table.remove(fxList, i)
+		else
+			local e = 1 - (1 - k) ^ 2
+			local r = lerp(f.startR, f.maxR, e)
+			f.part.Size = V(0.2 * sz, 2 * r, 2 * r)
+			f.part.CFrame = CFrame.new(f.center) * CFrame.Angles(0, 0, math.pi / 2)
+			f.part.Transparency = 0.2 + 0.8 * k
+		end
+	end
+end
+
+local function updateSkin(J, bodyCF, att)
+	local sz = S.size
+	local function W(p) return bodyCF:PointToWorldSpace(p * sz) end
+	local k = skin
+
+	placeCyl(k.torso, W(J.pelvis), W(J.neck), 0.38 * sz)
+	setBall(k.pelvisB, W(J.pelvis), 0.62 * sz)
+	setBall(k.neckB, W(J.neck), 0.5 * sz)
+	placeCyl(k.shBar, W(J.shL), W(J.shR), 0.3 * sz)
+	placeCyl(k.hipBar, W(J.hipL), W(J.hipR), 0.32 * sz)
+
+	for _, side in ipairs({ "L", "R" }) do
+		local arm, leg = k["arm" .. side], k["leg" .. side]
+		local sh, el, hd = W(J["sh" .. side]), W(J["elb" .. side]), W(J["hand" .. side])
+		placeCyl(arm.up, sh, el, 0.3 * sz)
+		placeCyl(arm.fore, el, hd, 0.28 * sz)
+		setBall(arm.sh, sh, 0.44 * sz)
+		setBall(arm.el, el, 0.4 * sz)
+		setBall(arm.hand, hd, 0.58 * sz)
+		arm.trail.Enabled = (att and att.handTrail) or false
+
+		local hp, kn, an, to = W(J["hip" .. side]), W(J["knee" .. side]), W(J["ank" .. side]), W(J["toe" .. side])
+		placeCyl(leg.up, hp, kn, 0.36 * sz)
+		placeCyl(leg.low, kn, an, 0.33 * sz)
+		placeCyl(leg.foot, an, to, 0.30 * sz)
+		setBall(leg.hip, hp, 0.46 * sz)
+		setBall(leg.knee, kn, 0.42 * sz)
+		setBall(leg.ank, an, 0.40 * sz)
+		setBall(leg.toe, to, 0.32 * sz)
+	end
+
+	-- sword (on the back, or in the hand)
+	local hilt = W(J.swordHilt)
+	local dirW = bodyCF:VectorToWorldSpace(J.swordDir)
+	local upv = math.abs(dirW.Unit.Y) > 0.95 and Vector3.xAxis or Vector3.yAxis
+	k.sword.model:PivotTo(CFrame.lookAt(hilt, hilt + dirW, upv))
+	k.sword.trail.Enabled = (att and att.trail) or false
+end
+
+----------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "FTAPStickmanGui"
+gui.ResetOnSpawn = false
+local okParent = pcall(function()
+	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+local GUI_H = 336
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(200, GUI_H)
+main.Position = UDim2.new(0, 12, 0, 60)
+main.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -66, 0, 32)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Giant Stickman"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -32)
+body.Position = UDim2.fromOffset(0, 32)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 20)
+status.Position = UDim2.fromOffset(10, 0)
+status.BackgroundTransparency = 1
+status.Text = "Status: idle"
+status.TextColor3 = Color3.fromRGB(170, 170, 185)
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = body
+
+local function setStatus(t) status.Text = "Status: " .. t end
+
+local function makeButton(text, x, y, w, h, cb)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, h)
+	b.Position = UDim2.fromOffset(x, y)
+	b.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.Text = text
+	b.BorderSizePixel = 0
+	b.Parent = body
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+	b.MouseButton1Click:Connect(function() cb(b) end)
+	return b
+end
+
+local function makeLabel(text, x, y, w)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.fromOffset(w, 28)
+	l.Position = UDim2.fromOffset(x, y)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.Font = Enum.Font.Gotham
+	l.TextSize = 13
+	l.Parent = body
+	return l
+end
+
+local buildBtn, modeBtn, sitBtn, danceBtn
+local skillBtns = {}
+
+----------------------------------------------------------------
+-- Skills. Each returns the pose overrides for progress p (0..1):
+--   hR / hL   hand targets relative to the shoulder, in the torso frame
+--   armW      how strongly the arms follow them (0..1)
+--   blade     sword direction in the torso frame (bladeW = weight)
+--   tYaw/pYaw torso / pelvis twist, lean, pY (pelvis height), jump
+--   stW/front step into a stance, bodyYaw (whole body spin)
+--   rootVel   forward motion (studs/s), moveMul  walking allowed (0..1)
+--   trail / handTrail  swoosh trails, fx = {p, kind} one-shot effect
+----------------------------------------------------------------
+local IDLE_BLADE = V(0.12, 0.5, -0.86)
+
+local function skillPunch(p, a)
+	local s = a.side -- +1 right fist, -1 left fist
+	local att = { moveMul = 0, lockFace = true, front = (s > 0) and "L" or "R" }
+	att.armW = track(p, { { 0, 0 }, { 0.12, 1 }, { 0.8, 1 }, { 1, 0 } })
+	local hit = V(s * 0.2, -0.1, -3.0)
+	local pull = V(s * 0.3, -0.8, 0.9)
+	local rest = V(s * 0.3, -0.7, -0.8)
+	local mine = track(p, { { 0, pull }, { 0.28, pull }, { 0.4, hit }, { 0.52, hit }, { 0.8, rest }, { 1, rest } })
+	local guard = V(-s * 0.4, -0.7, -1.1)
+	if s > 0 then att.hR, att.hL = mine, guard else att.hL, att.hR = mine, guard end
+	att.tYaw = -s * track(p, { { 0, 0 }, { 0.28, 0.6 }, { 0.4, -0.5 }, { 0.52, -0.5 }, { 1, 0 } })
+	att.pYaw = att.tYaw * 0.6
+	att.lean = track(p, { { 0, 0 }, { 0.28, -0.1 }, { 0.4, 0.3 }, { 0.6, 0.3 }, { 1, 0 } })
+	att.pY = -track(p, { { 0, 0 }, { 0.28, 0.15 }, { 0.4, 0.35 }, { 0.7, 0.2 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.25, 0.5, 1.6 * S.size, a.dur)
+	att.fx = { p = 0.42, kind = "punch", hand = (s > 0) and "handR" or "handL" }
+	return att
+end
+
+local function skillSlam(p, a)
+	local att = { moveMul = 0, lockFace = true, front = "L" }
+	att.armW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	local upR, upL = V(0.45, 2.9, 0.4), V(-0.45, 2.9, 0.4)
+	local hitR, hitL = V(0.6, -0.7, -2.9), V(-0.6, -0.7, -2.9)
+	att.hR = track(p, { { 0, upR }, { 0.4, upR }, { 0.52, hitR }, { 1, hitR } })
+	att.hL = track(p, { { 0, upL }, { 0.4, upL }, { 0.52, hitL }, { 1, hitL } })
+	att.lean = track(p, { { 0, 0 }, { 0.4, -0.3 }, { 0.52, 1.0 }, { 0.8, 1.0 }, { 1, 0 } })
+	att.pY = track(p, { { 0, 0 }, { 0.4, 0.25 }, { 0.52, -1.6 }, { 0.8, -1.5 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.2, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.45, 0.6, 1.0 * S.size, a.dur)
+	att.fx = { p = 0.54, kind = "slam" }
+	return att
+end
+
+local function skillSpin(p, a)
+	local att = { moveMul = 0.4 }
+	att.armW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.hR, att.hL = V(3.0, 0.1, 0), V(-3.0, 0.1, 0)
+	att.bodyYaw = TAU * 2 * smooth(p)
+	att.pY = -track(p, { { 0, 0 }, { 0.2, 0.5 }, { 0.8, 0.5 }, { 1, 0 } })
+	att.lean = track(p, { { 0, 0 }, { 0.2, 0.12 }, { 0.8, 0.12 }, { 1, 0 } })
+	att.handTrail = p > 0.1 and p < 0.92
+	att.fx = { p = 0.2, kind = "spin" }
+	return att
+end
+
+local function skillSlash(p, a)
+	local att = { moveMul = 0, lockFace = true, front = "L" }
+	att.armW = track(p, { { 0, 0 }, { 0.1, 1 }, { 0.8, 1 }, { 1, 0 } })
+	att.bladeW = att.armW
+	local wR, sR, wB, sB
+	if a.var == 1 then -- diagonal: upper right -> lower left
+		wR, sR = V(0.7, 1.9, 0.9), V(-0.9, -1.1, -2.5)
+		wB, sB = V(0.3, 0.8, 0.5), V(-0.25, -0.55, -0.8)
+	else -- backhand: left -> right
+		wR, sR = V(-1.3, 0.2, -1.4), V(2.2, 0.0, -2.0)
+		wB, sB = V(-0.9, 0.0, -0.45), V(0.9, -0.1, -0.45)
+	end
+	local rest = V(0.4, -0.8, -1.2)
+	att.hR = track(p, { { 0, wR }, { 0.28, wR }, { 0.44, sR }, { 0.6, sR }, { 1, rest } })
+	att.blade = track(p, { { 0, wB }, { 0.28, wB }, { 0.44, sB }, { 0.6, sB }, { 1, IDLE_BLADE } }).Unit
+	att.hL = track(p, { { 0, V(-0.6, -0.5, -0.8) }, { 0.28, V(-1.2, -0.3, 0.5) },
+		{ 0.44, V(-0.9, -0.8, -1.8) }, { 1, V(-0.3, -0.7, -0.8) } })
+	local sgn = (a.var == 1) and 1 or -1
+	att.tYaw = sgn * track(p, { { 0, 0 }, { 0.28, -0.5 }, { 0.44, 0.6 }, { 0.6, 0.6 }, { 1, 0 } })
+	att.pYaw = att.tYaw * 0.5
+	att.lean = track(p, { { 0, 0 }, { 0.28, 0 }, { 0.44, 0.25 }, { 0.7, 0.2 }, { 1, 0 } })
+	att.pY = -track(p, { { 0, 0 }, { 0.44, 0.3 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.3, 0.5, 2.0 * S.size, a.dur)
+	att.trail = p > 0.3 and p < 0.64
+	att.fx = { p = 0.5, kind = "tip" }
+	return att
+end
+
+local function skillThrust(p, a)
+	local att = { moveMul = 0, lockFace = true, front = "L" }
+	att.armW = track(p, { { 0, 0 }, { 0.1, 1 }, { 0.8, 1 }, { 1, 0 } })
+	att.bladeW = att.armW
+	local pull, hit, rest = V(0.8, -0.8, 0.9), V(0.4, -0.2, -3.0), V(0.4, -0.8, -1.2)
+	att.hR = track(p, { { 0, pull }, { 0.3, pull }, { 0.45, hit }, { 0.65, hit }, { 1, rest } })
+	att.blade = V(0, 0.12, -1).Unit
+	att.hL = track(p, { { 0, V(-0.6, -0.5, -0.8) }, { 0.3, V(-1.0, -0.4, 0.9) },
+		{ 0.45, V(-1.2, -0.5, 0.7) }, { 1, V(-0.5, -0.7, -0.6) } })
+	att.tYaw = track(p, { { 0, 0 }, { 0.3, -0.4 }, { 0.45, 0.35 }, { 0.65, 0.35 }, { 1, 0 } })
+	att.pYaw = att.tYaw * 0.5
+	att.lean = track(p, { { 0, 0 }, { 0.3, 0.1 }, { 0.45, 0.45 }, { 0.7, 0.45 }, { 1, 0 } })
+	att.pY = -track(p, { { 0, 0 }, { 0.3, 0.2 }, { 0.45, 0.6 }, { 0.7, 0.5 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.28, 0.5, 5.0 * S.size, a.dur)
+	att.trail = p > 0.3 and p < 0.68
+	att.fx = { p = 0.46, kind = "tip" }
+	return att
+end
+
+local function skillCleave(p, a)
+	local att = { moveMul = 0, lockFace = true, front = "L" }
+	att.armW = track(p, { { 0, 0 }, { 0.12, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.bladeW = att.armW
+	local upR, upL = V(0.4, 2.8, 0.5), V(-0.3, 2.7, 0.5)
+	local hitR, hitL = V(0.4, -0.7, -2.9), V(-0.4, -0.7, -2.9)
+	att.hR = track(p, { { 0, upR }, { 0.45, upR }, { 0.58, hitR }, { 1, hitR } })
+	att.hL = track(p, { { 0, upL }, { 0.45, upL }, { 0.58, hitL }, { 1, hitL } })
+	att.blade = track(p, { { 0, V(0, 0.9, 0.45) }, { 0.45, V(0, 0.9, 0.45) },
+		{ 0.58, V(0, -0.6, -0.8) }, { 1, V(0, -0.6, -0.8) } }).Unit
+	att.jump = track(p, { { 0, 0 }, { 0.2, 0 }, { 0.45, 3.5 }, { 0.6, 0 }, { 1, 0 } })
+	att.pY = track(p, { { 0, 0 }, { 0.15, -0.9 }, { 0.22, -0.9 }, { 0.4, 0 }, { 0.58, -1.4 }, { 0.85, -1.3 }, { 1, 0 } })
+	att.lean = track(p, { { 0, 0 }, { 0.45, -0.25 }, { 0.58, 0.9 }, { 0.85, 0.9 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.22, 0.6, 3.5 * S.size, a.dur)
+	att.trail = p > 0.45 and p < 0.72
+	att.fx = { p = 0.6, kind = "chop" }
+	return att
+end
+
+local SKILLS = {
+	bare = {
+		{ name = "Punch", dur = 0.8, fn = skillPunch },
+		{ name = "Slam", dur = 1.6, fn = skillSlam },
+		{ name = "Spin", dur = 1.5, fn = skillSpin },
+	},
+	sword = {
+		{ name = "Slash", dur = 0.95, fn = skillSlash },
+		{ name = "Thrust", dur = 1.0, fn = skillThrust },
+		{ name = "Cleave", dur = 1.7, fn = skillCleave },
+	},
+}
+
+----------------------------------------------------------------
+-- Pose: the whole walk / run / idle / sit / dance / skill rig
+-- Body space: units, origin on the ground under the pelvis,
+-- +x right, +y up, -z forward.
+----------------------------------------------------------------
+local function computePose(t, dt, att)
+	local rb = runBlend
+	local w = smooth(speedNow / 4) -- 0 = standing, 1 = moving
+	local Aeff = lerp(1.3, 1.6, rb) -- half stride
+	local A = Aeff * w
+	local Hh = lerp(0.5, 1.1, rb) * w -- foot lift
+	local d = lerp(0.62, 0.38, rb) -- fraction of the cycle with a foot on the ground
+
+	-- cadence follows speed, so planted feet never slide
+	if speedNow > 0.5 then
+		phase = (phase + dt * math.pi * d * speedNow / (Aeff * S.size)) % TAU
+	end
+
+	-- one foot: forward offset, lift height, toe pitch
+	local function foot(ph)
+		local u = (ph / TAU) % 1
+		if u < d then -- stance: the foot slides back under the body
+			local tt = u / d
+			local heel = math.clamp((tt - 0.75) / 0.25, 0, 1)
+			return A * (1 - 2 * tt), 0, -0.55 * heel * w
+		else -- swing: the foot arcs forward
+			local tt = (u - d) / (1 - d)
+			local e = (1 - math.cos(math.pi * tt)) / 2
+			local si = math.sin(math.pi * tt)
+			return -A + 2 * A * e, Hh * si, 0.35 * si * w
+		end
+	end
+	local sL, lL, pL = foot(phase)
+	local sR, lR, pR = foot(phase + math.pi)
+
+	-- attack stance: front foot forward, back foot back
+	if att and att.stW and att.stW > 0 then
+		local fl = (att.front == "L") and 0.9 or -0.9
+		sL = lerp(sL, fl, att.stW)
+		sR = lerp(sR, -fl, att.stW)
+		lL, lR = lerp(lL, 0, att.stW), lerp(lR, 0, att.stW)
+		pL, pR = lerp(pL, 0, att.stW), lerp(pR, 0, att.stW)
+	end
+
+	-- pelvis: walk = highest in mid-stance, run = lowest (spring), sways over the stance leg
+	local pelvisY = HIP_Y0 + lerp(0.10, -0.28, rb) * w * math.cos(2 * (phase - math.pi * d))
+	local sway = lerp(0.22, 0.12, rb) * w * -math.cos(phase - math.pi * d)
+	local pelvisYaw = -0.16 * w * math.cos(phase)
+	local torsoYaw = 0.22 * w * math.cos(phase) -- shoulders counter-rotate
+	local lean = 0.03 + lerp(0.05, 0.36, rb) * w
+	local tRoll = 0
+	pelvisY += math.sin(t * 1.6) * 0.03 * (1 - w) -- breathing
+
+	-- dance layer
+	local b = t * math.pi * 4 -- 2 beats per second
+	if danceW > 0.001 then
+		pelvisY = lerp(pelvisY, HIP_Y0 - 0.35 + 0.3 * math.cos(b), danceW)
+		sway = lerp(sway, 0.5 * math.sin(b / 2), danceW)
+		pelvisYaw = lerp(pelvisYaw, 0.45 * math.sin(b / 2), danceW)
+		torsoYaw = lerp(torsoYaw, -0.4 * math.sin(b / 2), danceW)
+		tRoll = lerp(tRoll, 0.18 * math.sin(b / 2), danceW)
+		lean = lerp(lean, 0.1 + 0.05 * math.cos(b), danceW)
+		sL, sR = lerp(sL, 0, danceW), lerp(sR, 0, danceW)
+		lL = lerp(lL, 0.55 * math.max(0, math.sin(b / 2)), danceW)
+		lR = lerp(lR, 0.55 * math.max(0, -math.sin(b / 2)), danceW)
+		pL, pR = lerp(pL, 0, danceW), lerp(pR, 0, danceW)
+	end
+	-- sit layer
+	if sitW > 0.001 then
+		pelvisY = lerp(pelvisY, 0.5, sitW)
+		sway = lerp(sway, 0, sitW)
+		pelvisYaw = lerp(pelvisYaw, 0, sitW)
+		torsoYaw = lerp(torsoYaw, 0, sitW)
+		lean = lerp(lean, 0.2 + 0.03 * math.sin(t * 1.6), sitW)
+		pL, pR = lerp(pL, 0, sitW), lerp(pR, 0, sitW)
+	end
+	-- skill layer
+	local jump = 0
+	if att then
+		pelvisY += (att.pY or 0)
+		jump = att.jump or 0
+		pelvisY += jump
+		pelvisYaw += att.pYaw or 0
+		torsoYaw += att.tYaw or 0
+		lean += att.lean or 0
+	end
+
+	local pelvisRot = CFrame.Angles(0, pelvisYaw, 0)
+	local torsoRot = CFrame.Angles(0, torsoYaw, 0) * CFrame.Angles(-lean, 0, 0) * CFrame.Angles(0, 0, tRoll)
+
+	local J = {}
+	local pelvis = V(sway, pelvisY, 0)
+	J.pelvis = pelvis
+	J.spineLow = pelvis + torsoRot * V(0, 0.8, 0)
+	J.spineMid = pelvis + torsoRot * V(0, 1.6, 0)
+	J.chest = pelvis + torsoRot * V(0, 2.3, 0)
+	J.neck = pelvis + torsoRot * V(0, TORSO, 0)
+	J.shL = J.neck + torsoRot * V(-SH_W, -0.2, 0)
+	J.shR = J.neck + torsoRot * V(SH_W, -0.2, 0)
+	J.hipL = pelvis + pelvisRot * V(-HIP_W, 0, 0)
+	J.hipR = pelvis + pelvisRot * V(HIP_W, 0, 0)
+
+	-- legs ---------------------------------------------------------
+	local function ankle(side, s, lift)
+		local x = side * lerp(0.7, 0.95, danceW)
+		local a = V(x, 0.18 + lift + jump * 0.8, -s)
+		if sitW > 0 then a = a:Lerp(V(side * 0.8, 0.18, -2.5), sitW) end
+		return a
+	end
+	J.ankL, J.ankR = ankle(-1, sL, lL), ankle(1, sR, lR)
+	local kneePole = pelvisRot * V(0, 0.15, -1):Lerp(V(0, 1, -0.1), sitW)
+	J.kneeL = ik(J.hipL, J.ankL, kneePole, LEG)
+	J.kneeR = ik(J.hipR, J.ankR, kneePole, LEG)
+	local function toe(ank, pitch)
+		return ank + pelvisRot * V(0, 0.65 * math.sin(pitch) - 0.12, -0.65 * math.cos(pitch))
+	end
+	J.toeL, J.toeR = toe(J.ankL, pL), toe(J.ankR, pR)
+
+	-- arms ---------------------------------------------------------
+	local reach = (ARM * 2) * lerp(0.96, 0.62, rb)
+	local swing = lerp(0.55, 0.95, rb) * w * math.cos(phase)
+	local function locoHand(sh, side)
+		local th = ((side < 0) and -swing or swing) + 0.04 * math.sin(t * 1.6 + side)
+		return sh + torsoRot * (V(side * 0.28, -math.cos(th), -math.sin(th)) * reach)
+	end
+	local hL, hR = locoHand(J.shL, -1), locoHand(J.shR, 1)
+
+	if att and att.armW and att.armW > 0 then
+		if att.hR then hR = hR:Lerp(J.shR + torsoRot * att.hR, att.armW) end
+		if att.hL then hL = hL:Lerp(J.shL + torsoRot * att.hL, att.armW) end
+	end
+	if danceW > 0.001 then
+		local dR = J.shR + torsoRot * V(0.9, 2.3 + 0.6 * math.sin(b), -0.3 + 0.4 * math.cos(b / 2))
+		local dL = J.shL + torsoRot * V(-0.9, 2.3 + 0.6 * math.sin(b + math.pi), -0.3 - 0.4 * math.cos(b / 2))
+		hR, hL = hR:Lerp(dR, danceW), hL:Lerp(dL, danceW)
+	end
+	if sitW > 0.001 then -- hands rest on the knees
+		hR = hR:Lerp(J.kneeR + V(0.1, 0.3, 0.15), sitW)
+		hL = hL:Lerp(J.kneeL + V(-0.1, 0.3, 0.15), sitW)
+	end
+	local maxLen = ARM * 2 * 0.999
+	hR, hL = clampReach(J.shR, hR, maxLen), clampReach(J.shL, hL, maxLen)
+
+	-- sword: on the back (bare hand) <-> in the right hand (sword mode)
+	local e = smooth(swordT)
+	local bladeT = IDLE_BLADE
+	if att and att.blade then bladeT = IDLE_BLADE:Lerp(att.blade, att.bladeW or 1) end
+	local handDir = (torsoRot * bladeT).Unit
+	local backHilt = J.neck + torsoRot * V(0.45, 0.35, 0.5)
+	local backDir = (torsoRot * V(-0.5, -0.85, 0.12)).Unit
+	local hiltPos = backHilt:Lerp(hR, e)
+	local dir = backDir:Lerp(handDir, e)
+	dir = dir.Magnitude > 1e-3 and dir.Unit or handDir
+	-- while drawing / sheathing the hand reaches back to the hilt
+	local reachW = smooth(math.min(swordT * 3, 1)) * smooth(math.min((1 - swordT) * 3, 1))
+	hR = hR:Lerp(hiltPos, reachW)
+
+	J.elbL = ik(J.shL, hL, torsoRot * V(-0.35, -0.4, 1.0), ARM)
+	J.elbR = ik(J.shR, hR, torsoRot * V(0.35, -0.4, 1.0), ARM)
+	J.handL, J.handR = hL, hR
+	J.swordHilt, J.swordDir = hiltPos, dir
+	J.swordMid = hiltPos + dir * 2.3
+	J.swordTip = hiltPos + dir * 4.25
+	return J
+end
+
+----------------------------------------------------------------
+-- Control / camera
+----------------------------------------------------------------
+local function restoreHum()
+	if savedHum and savedHum.hum and savedHum.hum.Parent then
+		local h = savedHum.hum
+		h.WalkSpeed = savedHum.WalkSpeed
+		h.JumpPower = savedHum.JumpPower
+		h.JumpHeight = savedHum.JumpHeight
+	end
+	savedHum = nil
+end
+
+local function freezeHum(hum)
+	if savedHum and savedHum.hum == hum then return end
+	restoreHum()
+	savedHum = {
+		hum = hum,
+		WalkSpeed = hum.WalkSpeed,
+		JumpPower = hum.JumpPower,
+		JumpHeight = hum.JumpHeight,
+	}
+	hum.WalkSpeed = 0 -- your joystick steers the stickman, not your avatar
+	hum.JumpPower = 0
+	hum.JumpHeight = 0
+end
+
+local lastZoom = nil
+local function applyControl(hum)
+	freezeHum(hum)
+	if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+	local want = (camPart and S.camFollow) and camPart or hum
+	if lastSubject ~= want then
+		cam.CameraSubject = want
+		lastSubject = want
+	end
+	-- a giant needs the camera further away
+	local zoom = S.camFollow and S.size * 6.5 or origZoom.min
+	if lastZoom ~= zoom then
+		lp.CameraMinZoomDistance = zoom
+		lp.CameraMaxZoomDistance = math.max(origZoom.max, S.size * 45)
+		lastZoom = zoom
+	end
+end
+
+----------------------------------------------------------------
+-- Actions
+----------------------------------------------------------------
+local function setMode(m)
+	if S.attack then return end
+	S.mode = m
+	modeBtn.Text = "Mode: " .. (m == "sword" and "Sword" or "Bare Hand")
+	for i, b in ipairs(skillBtns) do b.Text = SKILLS[m][i].name end
+	if S.active then setStatus(m == "sword" and "drawing sword" or "sheathing sword") end
+end
+
+local function startSkill(i)
+	if not S.active or S.attack then return end
+	if swordT > 0.02 and swordT < 0.98 then return end -- still drawing / sheathing
+	local sk = SKILLS[S.mode][i]
+	S.emote = nil
+	local a = { name = sk.name, fn = sk.fn, dur = sk.dur, t0 = tick(), fired = false }
+	if sk.name == "Punch" then
+		punchSide = -punchSide
+		a.side = punchSide
+	elseif sk.name == "Slash" then
+		slashVar = (slashVar == 1) and 2 or 1
+		a.var = slashVar
+	end
+	S.attack = a
+	lastInput = tick()
+	setStatus(sk.name)
+end
+
+local function toggleEmote(name)
+	if not S.active or S.attack then return end
+	S.emote = (S.emote == name) and nil or name
+	lastInput = tick()
+	setStatus(S.emote and S.emote or "ready")
+end
+
+----------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------
+local function step(dt)
+	local root, hum = getRoot(), getHum()
+	if not root or not hum then return end
+	local t = tick()
+	local sz = S.size
+
+	applyControl(hum)
+
+	-- input: the joystick steers the stickman; moving stands it up
+	local m3 = hum.MoveDirection
+	local md = V(m3.X, 0, m3.Z)
+	local moveInput = md.Magnitude > 0.1
+	if moveInput then
+		lastInput = t
+		if S.emote then S.emote = nil end
+	end
+	if (t - lastInput) > AFK_TIME and not S.emote and not S.attack then
+		S.emote = "sit" -- away from keyboard: sit down
+		setStatus("sitting (afk)")
+	end
+
+	-- current skill
+	local a, att, p = S.attack, nil, 0
+	if a then
+		p = (t - a.t0) / a.dur
+		if p >= 1 then
+			S.attack = nil
+			a = nil
+			setStatus("ready")
+		else
+			att = a.fn(p, a)
+		end
+	end
+
+	-- sword draw / sheathe, emote blends
+	local goal = (S.mode == "sword") and 1 or 0
+	swordT += math.clamp(goal - swordT, -dt / 0.7, dt / 0.7)
+	sitW += ((S.emote == "sit" and 1 or 0) - sitW) * (1 - math.exp(-dt * 3))
+	danceW += ((S.emote == "dance" and 1 or 0) - danceW) * (1 - math.exp(-dt * 4))
+
+	-- locomotion
+	local runOn = S.run or S.runHeld
+	local mm = att and att.moveMul or 1
+	local target = 0
+	if moveInput and not S.emote then
+		target = (runOn and 11 or 4.5) * sz * S.speedMul * mm
+	end
+	speedNow += (target - speedNow) * (1 - math.exp(-dt * 5))
+	runBlend += (((runOn and moveInput) and 1 or 0) - runBlend) * (1 - math.exp(-dt * 4))
+
+	if moveInput and not S.emote and not (att and att.lockFace) then
+		local want = math.atan2(-md.X, -md.Z)
+		local diff = (want - yaw + math.pi) % TAU - math.pi
+		yaw += math.clamp(diff, -TURN * dt, TURN * dt)
+	end
+	local facing = V(-math.sin(yaw), 0, -math.cos(yaw))
+	pos += facing * speedNow * dt
+	if att and att.rootVel then pos += facing * att.rootVel * dt end
+
+	-- stay on the ground
+	local ignore = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ignore, folder) end
+	if skin then table.insert(ignore, skin.model) end
+	rayParams.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(V(pos.X, pos.Y + 8 * sz, pos.Z), V(0, -3000, 0), rayParams)
+	local gy = hit and hit.Position.Y or pos.Y
+	pos = V(pos.X, pos.Y + (gy - pos.Y) * math.min(1, dt * 15), pos.Z)
+
+	-- the pose
+	local J = computePose(t, dt, att)
+	local bodyCF = CFrame.new(pos) * CFrame.Angles(0, yaw + ((att and att.bodyYaw) or 0), 0)
+	local function W(pt) return bodyCF:PointToWorldSpace(pt * sz) end
+
+	-- one-shot effects (shockwaves)
+	if att and att.fx and a and not a.fired and p >= att.fx.p then
+		a.fired = true
+		local k = att.fx.kind
+		local ground = V(pos.X, gy + 0.3 * sz, pos.Z)
+		if k == "slam" then
+			spawnRing(ground + facing * 3.2 * sz, 11 * sz, Color3.new(1, 1, 1), 0.8)
+		elseif k == "punch" then
+			spawnRing(W(J[att.fx.hand]), 2.4 * sz, Color3.fromRGB(255, 220, 120), 0.4)
+		elseif k == "spin" then
+			spawnRing(ground, 8 * sz, Color3.fromRGB(190, 230, 255), 0.7)
+		elseif k == "tip" then
+			spawnRing(W(J.swordTip), 3 * sz, Color3.fromRGB(150, 235, 255), 0.45)
+		elseif k == "chop" then
+			local tip = W(J.swordTip)
+			spawnRing(V(tip.X, gy + 0.3 * sz, tip.Z), 12 * sz, Color3.fromRGB(150, 235, 255), 0.8)
+		end
+	end
+	updateFx()
+
+	if S.skin and skin then updateSkin(J, bodyCF, att) end
+
+	-- camera focus + avatar stays with the stickman's feet
+	if camPart then camPart.CFrame = CFrame.new(pos + V(0, 3.5 * sz, 0)) end
+	if S.avatar then
+		root.CFrame = CFrame.new(pos + V(0, 3, 0)) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	-- indestructible upkeep: one toy re-claimed every 0.1 s, refill every 1.5 s
+	if S.safe then
+		local floor = workspace.FallenPartsDestroyHeight + 100
+		if pos.Y < floor then pos = V(pos.X, floor, pos.Z) end
+		safeTimer += dt
+		if safeTimer >= 0.1 and #claimed > 0 then
+			safeTimer = 0
+			reclaimIdx = reclaimIdx % #claimed + 1
+			local c = claimed[reclaimIdx]
+			if c.part.Parent then
+				if not ownsPart(c.part) then claim(c.part) end
+				c.part.CanCollide = false
+			end
+		end
+		refillTimer += dt
+		if refillTimer >= 1.5 then
+			refillTimer = 0
+			refill()
+		end
+	end
+
+	-- toys follow the joints
+	local rot = bodyCF.Rotation
+	for _, c in ipairs(claimed) do
+		local part = c.part
+		if part.Parent then
+			local tgt = W(J[SLOTKEYS[c.si]])
+			if S.safe then
+				makeMovers(c)
+				if part.AssemblyLinearVelocity.Magnitude > 400 + sz * 40 then
+					part.AssemblyLinearVelocity = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+				end
+				if (part.Position - tgt).Magnitude > 300 then part.CFrame = CFrame.new(tgt) end
+			end
+			c.bp.Position = tgt
+			c.bg.CFrame = rot
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Summon / release
+----------------------------------------------------------------
+local function release()
+	S.active = false
+	S.attack = nil
+	S.emote = nil
+	if heartbeat then heartbeat:Disconnect() heartbeat = nil end
+	for _, c in ipairs(claimed) do
+		if c.bp then c.bp:Destroy() end
+		if c.bg then c.bg:Destroy() end
+		if c.part and c.part.Parent then c.part.CanCollide = c.oldCollide end
+	end
+	claimed, claimedSet = {}, {}
+	destroySkin()
+	restoreHum()
+	cam.CameraType = Enum.CameraType.Custom
+	local hum = getHum()
+	if hum then cam.CameraSubject = hum end
+	lastSubject = nil
+	if origZoom then
+		lp.CameraMinZoomDistance = origZoom.min
+		lp.CameraMaxZoomDistance = origZoom.max
+	end
+	lastZoom = nil
+	if camPart then camPart:Destroy() camPart = nil end
+	if buildBtn then buildBtn.Text = "Summon Stickman" end
+	setStatus("released")
+end
+
+local function build()
+	if S.busy or S.active then return end
+	local root = getRoot()
+	if not root then setStatus("no character") return end
+
+	local parts = getToyParts()
+	if #parts == 0 then setStatus("no toys found") return end
+
+	S.busy = true
+	setStatus("claiming toys...")
+	local origin = root.CFrame
+	local teleported = false
+
+	for i = 1, math.min(#SLOTKEYS, #parts) do
+		local part = parts[i]
+		if part.Parent then
+			-- only move if the toy is out of grab range
+			if (part.Position - root.Position).Magnitude > 30 then
+				root.CFrame = part.CFrame * CFrame.new(0, 4, 0)
+				teleported = true
+				task.wait(0.08)
+			end
+			if claim(part) then
+				addToy(part, #claimed + 1)
+			end
+		end
+	end
+	if teleported then root.CFrame = origin end
+
+	if #claimed == 0 then
+		S.busy = false
+		setStatus("no toys claimed")
+		return
+	end
+
+	-- appear in front of you, facing the way you look
+	local look = root.CFrame.LookVector
+	local flat = V(look.X, 0, look.Z)
+	flat = flat.Magnitude > 1e-3 and flat.Unit or V(0, 0, -1)
+	yaw = math.atan2(-flat.X, -flat.Z)
+	local spot = root.Position + flat * (S.size * 5)
+	local ign = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ign, folder) end
+	rayParams.FilterDescendantsInstances = ign
+	local hit = workspace:Raycast(V(spot.X, root.Position.Y + 20, spot.Z), V(0, -500, 0), rayParams)
+	pos = V(spot.X, hit and hit.Position.Y or (root.Position.Y - 3), spot.Z)
+	speedNow, runBlend, phase = 0, 0, 0
+	sitW, danceW = 0, 0
+	swordT = (S.mode == "sword") and 1 or 0
+	lastInput = tick()
+
+	origZoom = origZoom or { min = lp.CameraMinZoomDistance, max = lp.CameraMaxZoomDistance }
+	camPart = Instance.new("Part")
+	camPart.Name = "StickmanCam"
+	camPart.Anchored = true
+	camPart.CanCollide = false
+	camPart.CanQuery = false
+	camPart.CanTouch = false
+	camPart.Transparency = 1
+	camPart.Size = V(1, 1, 1)
+	camPart.CFrame = CFrame.new(pos + V(0, 3.5 * S.size, 0))
+	camPart.Parent = workspace
+
+	if S.skin then buildSkin() end
+
+	S.active = true
+	buildBtn.Text = "Dismiss Stickman"
+	setStatus("ready")
+	heartbeat = RunService.Heartbeat:Connect(step)
+	S.busy = false
+end
+
+----------------------------------------------------------------
+-- Controls
+----------------------------------------------------------------
+buildBtn = makeButton("Summon Stickman", 10, 22, 180, 28, function()
+	if S.active then release() else task.spawn(build) end
+end)
+
+modeBtn = makeButton("Mode: Bare Hand", 10, 52, 180, 28, function()
+	setMode(S.mode == "bare" and "sword" or "bare")
+end)
+
+for i = 1, 3 do
+	skillBtns[i] = makeButton(SKILLS.bare[i].name, 10 + (i - 1) * 62, 82, 56, 30, function()
+		startSkill(i)
+	end)
+end
+
+sitBtn = makeButton("Sit", 10, 116, 88, 28, function() toggleEmote("sit") end)
+danceBtn = makeButton("Dance", 102, 116, 88, 28, function() toggleEmote("dance") end)
+
+makeButton("Run: OFF", 10, 146, 88, 28, function(b)
+	S.run = not S.run
+	b.Text = "Run: " .. (S.run and "ON" or "OFF")
+	b.BackgroundColor3 = S.run and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(52, 52, 66)
+end)
+makeButton("Avatar: Feet", 102, 146, 88, 28, function(b)
+	S.avatar = not S.avatar
+	b.Text = "Avatar: " .. (S.avatar and "Feet" or "Stay")
+end)
+
+local sizeLabel = makeLabel("Size: 8", 10, 176, 90)
+local function changeSize(delta)
+	S.size = math.clamp(S.size + delta, 3, 16)
+	sizeLabel.Text = "Size: " .. S.size
+	lastZoom = nil
+	if S.active and S.skin then buildSkin() end -- rebuilt at the new size
+end
+makeButton("-", 104, 176, 40, 28, function() changeSize(-1) end)
+makeButton("+", 150, 176, 40, 28, function() changeSize(1) end)
+
+local speedLabel = makeLabel("Speed: 1.0x", 10, 206, 90)
+makeButton("-", 104, 206, 40, 28, function()
+	S.speedMul = math.max(0.5, S.speedMul - 0.25)
+	speedLabel.Text = ("Speed: %.2fx"):format(S.speedMul)
+end)
+makeButton("+", 150, 206, 40, 28, function()
+	S.speedMul = math.min(2.5, S.speedMul + 0.25)
+	speedLabel.Text = ("Speed: %.2fx"):format(S.speedMul)
+end)
+
+makeButton("Cam: Follow", 10, 236, 88, 28, function(b)
+	S.camFollow = not S.camFollow
+	b.Text = "Cam: " .. (S.camFollow and "Follow" or "Me")
+	lastZoom = nil
+end)
+makeButton("Skin: ON", 102, 236, 88, 28, function(b)
+	S.skin = not S.skin
+	b.Text = "Skin: " .. (S.skin and "ON" or "OFF")
+	if S.active then
+		if S.skin then buildSkin() else destroySkin() end
+	end
+end)
+
+makeButton("Safe: ON", 10, 266, 180, 28, function(b)
+	S.safe = not S.safe
+	b.Text = "Safe: " .. (S.safe and "ON" or "OFF")
+	b.BackgroundColor3 = S.safe and Color3.fromRGB(60, 130, 80) or Color3.fromRGB(52, 52, 66)
+end).BackgroundColor3 = Color3.fromRGB(60, 130, 80)
+
+-- PC keys
+table.insert(conns, UIS.InputBegan:Connect(function(input, gpe)
+	lastInput = tick() -- any input counts as "not afk"
+	if gpe then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.Q then startSkill(1)
+	elseif k == Enum.KeyCode.E then startSkill(2)
+	elseif k == Enum.KeyCode.R then startSkill(3)
+	elseif k == Enum.KeyCode.M then setMode(S.mode == "bare" and "sword" or "bare")
+	elseif k == Enum.KeyCode.K then toggleEmote("sit")
+	elseif k == Enum.KeyCode.L then toggleEmote("dance")
+	elseif k == Enum.KeyCode.LeftShift then S.runHeld = true end
+end))
+table.insert(conns, UIS.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.LeftShift then S.runHeld = false end
+end))
+
+-- Close / unload
+local function unload()
+	S.dead = true
+	release()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+	if gui then gui:Destroy() end
+	env.FTAPStickmanUnload = nil
+end
+env.FTAPStickmanUnload = unload
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(24, 24)
+close.Position = UDim2.new(1, -30, 0, 4)
+close.BackgroundColor3 = Color3.fromRGB(150, 50, 50)
+close.Text = "X"
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 12
+close.BorderSizePixel = 0
+close.Parent = main
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+close.MouseButton1Click:Connect(unload)
+
+local mini = Instance.new("TextButton")
+mini.Size = UDim2.fromOffset(24, 24)
+mini.Position = UDim2.new(1, -58, 0, 4)
+mini.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+mini.Text = "-"
+mini.TextColor3 = Color3.new(1, 1, 1)
+mini.Font = Enum.Font.GothamBold
+mini.TextSize = 14
+mini.BorderSizePixel = 0
+mini.Parent = main
+Instance.new("UICorner", mini).CornerRadius = UDim.new(0, 6)
+local minimized = false
+mini.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	main.Size = minimized and UDim2.fromOffset(200, 32) or UDim2.fromOffset(200, GUI_H)
+	mini.Text = minimized and "+" or "-"
+end)
+
+-- Dragging (kept on screen)
+do
+	local dragging, dragStart, startPos
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			local vp = gui.AbsoluteSize
+			local nx = math.clamp(startPos.X.Offset + d.X, 0, math.max(0, vp.X - main.AbsoluteSize.X))
+			local ny = math.clamp(startPos.Y.Offset + d.Y, 0, math.max(0, vp.Y - 40))
+			main.Position = UDim2.new(0, nx, 0, ny)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end
