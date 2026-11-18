@@ -1,0 +1,124 @@
+-- NOSEY CLIENT | LocalScript -> StarterPlayer > StarterPlayerScripts
+-- Cutscene camera + owner panel (Offline / Online / Anger / Cutscene / Control).
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local plr = Players.LocalPlayer
+local remote = RS:WaitForChild("NoseyRemote")
+local cam = workspace.CurrentCamera
+
+-- ============ CUTSCENE (matches server timing: 3.5s + 1.2s + 2.2s) ============
+local function cutscene()
+	local nosey = workspace:WaitForChild("Nosey")
+	local root, head = nosey:WaitForChild("HumanoidRootPart"), nosey:WaitForChild("Head")
+	local function go(goal, t)
+		local tw = TweenService:Create(cam, TweenInfo.new(t, Enum.EasingStyle.Sine), { CFrame = goal })
+		tw:Play()
+		tw.Completed:Wait()
+	end
+	local rc = root.CFrame
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.CFrame = CFrame.lookAt((rc * CFrame.new(0, -1, -60)).Position, head.Position)      -- low wide shot
+	go(CFrame.lookAt((rc * CFrame.new(0, 1.5, -16)).Position, head.Position), 3.5)         -- slow push to face
+	task.wait(1.2)                                                                          -- eyes light up
+	go(CFrame.lookAt((rc * CFrame.new(22, 3, -30)).Position, root.Position + Vector3.new(0, 3, 0)), 2.2)
+	cam.CameraType = Enum.CameraType.Custom
+end
+
+remote.OnClientEvent:Connect(function(action)
+	if action == "Cutscene" then cutscene() end
+end)
+
+-- ============ CONTROL ============
+local controlling, sprintOn, controls = false, false, nil
+local function setControl(on)
+	controlling = on
+	remote:FireServer("Control", on)
+	local nosey = workspace:FindFirstChild("Nosey")
+	local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+	if on and nosey then
+		cam.CameraSubject = nosey:FindFirstChildOfClass("Humanoid")
+		plr.CameraMinZoomDistance, plr.CameraMaxZoomDistance = 25, 60
+		if hum then hum.WalkSpeed = 0 end
+	else
+		if hum then
+			cam.CameraSubject = hum
+			hum.WalkSpeed = 16
+		end
+		plr.CameraMinZoomDistance, plr.CameraMaxZoomDistance = 0.5, 128
+	end
+end
+
+local acc = 0
+RunService.RenderStepped:Connect(function(dt)
+	if not controlling then return end
+	acc += dt
+	if acc < 0.05 then return end -- 20 updates/sec
+	acc = 0
+	controls = controls or require(plr.PlayerScripts:WaitForChild("PlayerModule")):GetControls()
+	local mv = controls:GetMoveVector()
+	local d = cam.CFrame:VectorToWorldSpace(Vector3.new(mv.X, 0, mv.Z))
+	d = Vector3.new(d.X, 0, d.Z)
+	if d.Magnitude > 0 then d = d.Unit end
+	remote:FireServer("Drive", d, sprintOn or UIS:IsKeyDown(Enum.KeyCode.LeftShift))
+end)
+
+-- ============ PANEL ============
+local function buildGui()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "NoseyPanel"
+	gui.ResetOnSpawn = false
+	gui.Parent = plr:WaitForChild("PlayerGui")
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.fromOffset(150, 270)
+	frame.Position = UDim2.new(0, 10, 0.5, -135)
+	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+	frame.BackgroundTransparency = 0.15
+	frame.Parent = gui
+	local list = Instance.new("UIListLayout")
+	list.Padding = UDim.new(0, 6)
+	list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	list.Parent = frame
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 8)
+	pad.Parent = frame
+
+	local function btn(text, color, fn)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, -16, 0, 34)
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 14
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.BackgroundColor3 = color
+		b.Parent = frame
+		b.Activated:Connect(function() fn(b) end)
+		return b
+	end
+
+	btn("Offline", Color3.fromRGB(60, 60, 66), function() remote:FireServer("SetMode", "Offline") end)
+	btn("Online", Color3.fromRGB(40, 110, 70), function() remote:FireServer("SetMode", "Online") end)
+	btn("Anger", Color3.fromRGB(160, 40, 40), function() remote:FireServer("SetMode", "Anger") end)
+	btn("Cutscene", Color3.fromRGB(90, 70, 140), function() remote:FireServer("Cutscene") end)
+	btn("Control: OFF", Color3.fromRGB(50, 90, 150), function(b)
+		setControl(not controlling)
+		b.Text = controlling and "Control: ON" or "Control: OFF"
+	end)
+	btn("Sprint: OFF (Shift)", Color3.fromRGB(50, 90, 150), function(b)
+		sprintOn = not sprintOn
+		b.Text = sprintOn and "Sprint: ON" or "Sprint: OFF (Shift)"
+	end)
+end
+
+local function onOwner()
+	if plr:GetAttribute("NoseyOwner") and not plr.PlayerGui:FindFirstChild("NoseyPanel") then
+		buildGui()
+	end
+end
+plr:GetAttributeChangedSignal("NoseyOwner"):Connect(onOwner)
+onOwner()
