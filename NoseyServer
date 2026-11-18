@@ -1,0 +1,333 @@
+-- NOSEY ANIMATRONIC | Script -> ServerScriptService
+-- Builds Nosey from bricks, animates it procedurally, 3 modes, cutscene, owner control.
+-- Pair with NoseyClient.client.lua (StarterPlayerScripts).
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+
+local CONFIG = {
+	OWNER_USERID = 0,                 -- 0 = game creator (and anyone in Studio)
+	SPAWN = Vector3.new(0, 0, 0),     -- ground position
+	SCALE = 1,                        -- 1 = ~10.9 studs tall (10 ft). 2 = double
+	RUN_SPEED = 50,                   -- studs/sec (32 mph = ~51)
+	PATROL_SPEED = 16,
+	SIGHT = 120,                      -- Online mode sight range (needs line of sight)
+	KILL_DIST = 6,
+}
+local S = CONFIG.SCALE
+local V = Vector3.new
+local ORIGIN = CFrame.new(CONFIG.SPAWN)
+
+local remote = Instance.new("RemoteEvent")
+remote.Name = "NoseyRemote"
+remote.Parent = RS
+
+-- ===================== BUILD =====================
+local model = Instance.new("Model")
+model.Name = "Nosey"
+local count = 0
+
+local DARK = Color3.fromRGB(40, 40, 46)
+local MID = Color3.fromRGB(85, 85, 92)
+local RUST = Color3.fromRGB(110, 80, 60)
+local BIB = Color3.fromRGB(205, 198, 180)
+local EYE = {
+	Offline = Color3.fromRGB(15, 15, 15),
+	Online = Color3.fromRGB(255, 240, 170),
+	Anger = Color3.fromRGB(255, 30, 30),
+}
+
+local function mk(name, size, pos, color, parent, opts)
+	opts = opts or {}
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Size = size * S
+	p.CFrame = ORIGIN * CFrame.new(pos * S) * (opts.rot or CFrame.new())
+	p.Color = color
+	p.Material = opts.mat or Enum.Material.Metal
+	p.CanCollide = false          -- never pushes/flings players, can't be shoved over
+	p.Massless = not opts.root
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = model
+	count += 1
+	if parent then
+		local w = Instance.new("WeldConstraint")
+		w.Part0 = parent
+		w.Part1 = p
+		w.Parent = p
+	end
+	return p
+end
+
+local J = {}
+local function joint(name, p0, p1, pos)
+	local cf = ORIGIN * CFrame.new(pos * S)
+	local m = Instance.new("Motor6D")
+	m.Name = name
+	m.Part0 = p0
+	m.Part1 = p1
+	m.C0 = p0.CFrame:Inverse() * cf
+	m.C1 = p1.CFrame:Inverse() * cf
+	m.Parent = p0
+	J[name] = { m = m, c0 = m.C0 }
+end
+
+-- core
+local root = mk("HumanoidRootPart", V(2.6, 1, 1.4), V(0, 5.4, 0), MID, nil, { root = true })
+local torso = mk("Torso", V(3.2, 3, 1.7), V(0, 7.4, 0), DARK)
+mk("Collar", V(2.0, 0.35, 2.0), V(0, 9.0, 0), RUST, torso)
+mk("Bib", V(1.4, 2.4, 0.3), V(0, 7.3, -0.95), BIB, torso, { mat = Enum.Material.Fabric })
+local head = mk("Head", V(1.9, 1.7, 1.9), V(0, 10.05, 0), DARK)
+mk("Visor", V(2.0, 0.9, 0.3), V(0, 10.15, -0.95), MID, head)
+local eyeL = mk("EyeL", V(0.4, 0.3, 0.15), V(-0.45, 10.2, -1.12), EYE.Offline, head, { mat = Enum.Material.Neon })
+local eyeR = mk("EyeR", V(0.4, 0.3, 0.15), V(0.45, 10.2, -1.12), EYE.Offline, head, { mat = Enum.Material.Neon })
+mk("Mouth", V(1.0, 0.3, 0.15), V(0, 9.7, -1.0), RUST, head)
+joint("Waist", root, torso, V(0, 5.9, 0))
+joint("Neck", torso, head, V(0, 9.2, 0))
+
+for _, s in ipairs({ -1, 1 }) do
+	local sd = s < 0 and "L" or "R"
+	-- antenna
+	local ant = mk("Ant" .. sd, V(0.3, 3, 0.3), V(s * 0.6, 12.4, 0), RUST, nil, { rot = CFrame.Angles(0, 0, -s * 0.15) })
+	joint("Ant" .. sd, head, ant, V(s * 0.6, 10.9, 0))
+	-- arm
+	local up = mk("UpperArm" .. sd, V(1.1, 2, 1.1), V(s * 2.15, 7.7, 0), DARK)
+	mk("ShoulderPad" .. sd, V(1.5, 0.4, 1.5), V(s * 2.15, 8.75, 0), MID, up)
+	mk("ElbowBand" .. sd, V(1.3, 0.3, 1.3), V(s * 2.15, 6.7, 0), RUST, up)
+	local fore = mk("Forearm" .. sd, V(1.0, 2.4, 1.0), V(s * 2.15, 5.3, 0), DARK)
+	mk("Bracer" .. sd, V(1.25, 1.2, 1.25), V(s * 2.15, 5.6, 0), MID, fore)
+	local palm = mk("Palm" .. sd, V(0.9, 0.8, 0.5), V(s * 2.15, 3.7, 0), MID, fore)
+	for i, fx in ipairs({ -0.33, -0.11, 0.11, 0.33 }) do
+		mk("Finger" .. sd .. i, V(0.15, 0.8, 0.15), V(s * 2.15 + fx, 3.0, 0), DARK, palm)
+	end
+	joint("Shoulder" .. sd, torso, up, V(s * 2.15, 8.7, 0))
+	joint("Elbow" .. sd, up, fore, V(s * 2.15, 6.6, 0))
+	-- leg
+	local thigh = mk("Thigh" .. sd, V(1.2, 2.1, 1.2), V(s * 0.8, 3.85, 0), DARK)
+	mk("ThighStrap" .. sd, V(1.35, 0.25, 1.35), V(s * 0.8, 3.9, 0), RUST, thigh)
+	mk("KneePad" .. sd, V(1.3, 0.5, 0.4), V(s * 0.8, 2.8, -0.7), MID, thigh)
+	local shin = mk("Shin" .. sd, V(1.1, 2.4, 1.1), V(s * 0.8, 1.6, 0), DARK)
+	mk("ShinGuard" .. sd, V(1.3, 1.6, 0.3), V(s * 0.8, 1.6, -0.7), MID, shin)
+	mk("Foot" .. sd, V(1.3, 0.4, 2.2), V(s * 0.8, 0.2, -0.4), DARK, shin)
+	joint("Hip" .. sd, root, thigh, V(s * 0.8, 4.9, 0))
+	joint("Knee" .. sd, thigh, shin, V(s * 0.8, 2.8, 0))
+end
+
+local hum = Instance.new("Humanoid")
+hum.HipHeight = 4.9 * S
+hum.WalkSpeed = 0
+hum.MaxHealth = math.huge
+hum.Health = math.huge
+hum.RequiresNeck = false
+hum.BreakJointsOnDeath = false
+hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+hum:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+hum.Parent = model
+
+model.PrimaryPart = root
+model.Parent = workspace
+root:SetNetworkOwner(nil) -- server owns physics: players can't desync or shove it
+print(("[Nosey] built with %d bricks"):format(count))
+
+-- ===================== STATE =====================
+local mode, controller, busy, seenIntro = "Offline", nil, false, false
+local drive, sprint = Vector3.zero, false
+local crouch, crouchTarget, crouchRate = 1, 1, 4
+local shake, lastKill, patrolTarget = false, 0, nil
+
+local function setEyes(c)
+	eyeL.Color = c
+	eyeR.Color = c
+end
+setEyes(EYE.Offline)
+
+local function applyMode(m)
+	mode = m
+	model:SetAttribute("Mode", m)
+	setEyes(EYE[m])
+	shake = (m == "Anger")
+	crouchTarget = (m == "Offline") and 1 or 0
+	crouchRate = 4
+	if m == "Offline" then
+		hum.WalkSpeed = 0
+		hum:Move(Vector3.zero)
+	end
+end
+
+local function playCutscene(nextMode)
+	if busy then return end
+	busy, seenIntro = true, true
+	hum.WalkSpeed = 0
+	hum:Move(Vector3.zero)
+	applyMode("Offline")                     -- dark + crouched
+	remote:FireAllClients("Cutscene")
+	task.wait(3.5)                           -- camera push-in
+	setEyes(EYE.Online)
+	shake = true                             -- antennae twitch
+	task.wait(1.2)
+	crouchRate, crouchTarget = 1.6, 0        -- slow stand up
+	task.wait(2.2)
+	busy = false
+	applyMode(nextMode)
+end
+
+local function setMode(m)
+	if busy then return end
+	if m ~= "Offline" and not seenIntro then
+		task.spawn(playCutscene, m)
+	else
+		applyMode(m)
+	end
+end
+applyMode("Offline")
+
+-- ===================== AI =====================
+local rayParams = RaycastParams.new()
+rayParams.FilterDescendantsInstances = { model }
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function visible(r)
+	local o = root.Position + V(0, 4 * S, 0)
+	local hit = workspace:Raycast(o, r.Position - o, rayParams)
+	return hit == nil or hit.Instance:IsDescendantOf(r.Parent)
+end
+
+local function nearest(range, needLOS)
+	local best, bd
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = pl.Character
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if r and h and h.Health > 0 then
+			local d = (r.Position - root.Position).Magnitude
+			if d <= range and (not needLOS or visible(r)) and (not bd or d < bd) then
+				best, bd = pl, d
+			end
+		end
+	end
+	return best
+end
+
+local path = PathfindingService:CreatePath({ AgentRadius = 2 * S, AgentHeight = 11 * S, AgentCanJump = false })
+local function moveTo(pos, r)
+	if r and visible(r) then
+		hum:MoveTo(pos)
+		return
+	end
+	local ok = pcall(function()
+		path:ComputeAsync(root.Position - V(0, 4.9 * S, 0), pos)
+	end)
+	if ok and path.Status == Enum.PathStatus.Success then
+		local wp = path:GetWaypoints()
+		hum:MoveTo((wp[2] or wp[1]).Position)
+	else
+		hum:MoveTo(pos)
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.15)
+		if busy or controller or mode == "Offline" then continue end
+		local anger = (mode == "Anger")
+		local target = nearest(anger and math.huge or CONFIG.SIGHT, not anger)
+		if target then
+			local r = target.Character.HumanoidRootPart
+			hum.WalkSpeed = CONFIG.RUN_SPEED
+			moveTo(r.Position, r)
+			if (r.Position - root.Position).Magnitude < CONFIG.KILL_DIST * S and os.clock() - lastKill > 1 then
+				lastKill = os.clock()
+				local th = target.Character:FindFirstChildOfClass("Humanoid")
+				if th then th.Health = 0 end
+			end
+		else
+			hum.WalkSpeed = CONFIG.PATROL_SPEED
+			if not patrolTarget or (patrolTarget - root.Position).Magnitude < 8 then
+				patrolTarget = CONFIG.SPAWN + V(math.random(-80, 80), 0, math.random(-80, 80))
+			end
+			moveTo(patrolTarget)
+		end
+	end
+end)
+
+-- ===================== ANIMATION =====================
+local function setJ(name, rx, ry, rz)
+	local j = J[name]
+	j.m.C0 = j.c0 * CFrame.Angles(rx, ry or 0, rz or 0)
+end
+
+local phase, t = 0, 0
+RunService.Heartbeat:Connect(function(dt)
+	t += dt
+	if controller and not busy then
+		hum.WalkSpeed = sprint and CONFIG.RUN_SPEED or CONFIG.PATROL_SPEED
+		hum:Move(drive, false)
+	end
+	crouch += (crouchTarget - crouch) * math.clamp(dt * crouchRate, 0, 1)
+	hum.HipHeight = (4.9 - 2.3 * crouch) * S
+
+	local v = root.AssemblyLinearVelocity
+	local sp = V(v.X, 0, v.Z).Magnitude
+	local a = math.clamp(sp / CONFIG.RUN_SPEED, 0, 1)
+	phase += dt * (4 + sp * 0.5)
+	local sw = math.sin(phase)
+	local amp = (0.35 + 0.65 * a) * (1 - crouch * 0.8) * math.clamp(sp / 4, 0, 1)
+
+	setJ("HipL", crouch * 1.35 + sw * amp)
+	setJ("HipR", crouch * 1.35 - sw * amp)
+	setJ("KneeL", -crouch * 2.1 - math.max(0, math.cos(phase)) * a * 1.3)
+	setJ("KneeR", -crouch * 2.1 - math.max(0, -math.cos(phase)) * a * 1.3)
+	setJ("Waist", -crouch * 0.7 - a * 0.45)
+	setJ("ShoulderL", crouch * 0.5 - a * 0.4 - sw * 0.8 * a)
+	setJ("ShoulderR", crouch * 0.5 - a * 0.4 + sw * 0.8 * a)
+	setJ("ElbowL", 0.25 + a * 0.9 + crouch * 0.4)
+	setJ("ElbowR", 0.25 + a * 0.9 + crouch * 0.4)
+	setJ("Neck", crouch * 0.5 + a * 0.35, 0, math.sin(t * 0.7) * 0.04)
+
+	local sway = math.sin(t * 2.2) * 0.08
+	local tw = shake and math.sin(t * 40) * 0.12 or 0
+	setJ("AntL", 0, 0, sway + tw)
+	setJ("AntR", 0, 0, -sway - tw)
+
+	if root.Position.Y < -100 then model:PivotTo(ORIGIN + V(0, 6 * S, 0)) end
+end)
+
+-- ===================== OWNER CONTROL =====================
+local function isOwner(pl)
+	if RunService:IsStudio() then return true end
+	local id = CONFIG.OWNER_USERID ~= 0 and CONFIG.OWNER_USERID or game.CreatorId
+	return pl.UserId == id
+end
+
+local function tag(pl)
+	if isOwner(pl) then pl:SetAttribute("NoseyOwner", true) end
+end
+Players.PlayerAdded:Connect(tag)
+for _, pl in ipairs(Players:GetPlayers()) do tag(pl) end
+Players.PlayerRemoving:Connect(function(pl)
+	if controller == pl then
+		controller = nil
+		hum:Move(Vector3.zero)
+	end
+end)
+
+remote.OnServerEvent:Connect(function(pl, action, a, b)
+	if not isOwner(pl) then return end
+	if action == "SetMode" and EYE[a] then
+		setMode(a)
+	elseif action == "Cutscene" then
+		task.spawn(playCutscene, mode == "Offline" and "Online" or mode)
+	elseif action == "Control" then
+		controller = (a == true) and pl or nil
+		drive, sprint = Vector3.zero, false
+		if not controller then hum:Move(Vector3.zero) end
+	elseif action == "Drive" and controller == pl and typeof(a) == "Vector3" then
+		drive = a.Magnitude > 1 and a.Unit or a
+		sprint = (b == true)
+	end
+end)
