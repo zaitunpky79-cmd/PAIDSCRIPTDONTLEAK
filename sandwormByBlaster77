@@ -1,0 +1,1354 @@
+--[[ GIANT SAND WORM (FE)  -  uses EVERY brick it can find (minimum 60)
+  A huge segmented worm that swims half-buried in the sand, erupts, roars, lunges and slams.
+  Animation rules used: follow-the-leader body (overlap), traveling slither wave, ease in/out speed,
+  anticipation before every attack, follow-through springs, impact + ripple, weight (sag), breathing mouth.
+
+  Buttons : Summon | Hunt player (type a name) | Calm | Control (WASD) | Size box (type 10x, 50x, ...)
+  Abilities: Roar | Lunge (bites the typed player, or straight ahead) | Slam | Dive (hide under the sand)
+  Keys    : R roar, F lunge, G slam, V dive  (PC)   -   the buttons do the same on mobile
+
+  FE : unanchored + un-welded bricks you own, anti-gravity, your avatar rides inside the body.
+  Colors are LOCAL ONLY; the bricks themselves move for everyone.
+  CUTSCENE on Summon (swim-in -> coil -> eruption -> roar -> pull-back), with a Skip button.
+  GUARD: when another player stands near the worm, your hidden avatar parks on the bricks next to that player
+  so you stay the closest player and the worm does not fall apart.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+if _G.SandWormScript then pcall(_G.SandWormScript) end
+
+local CFG = {From = 1, To = math.huge, Want = math.huge, Size = 2, Strict = true, MinBricks = 60}
+local TAU = math.pi * 2
+
+-- state ----------------------------------------------------------------------
+local char, hrp, hum
+local alive = false
+local pool, P = {}, {}
+local saved, orient, targets = {}, {}, {}
+local lastPos, driftBad = {}, {}
+local camPart
+local Kb, Tb = 3, 1
+local nSeg, segK, segM = 21, 5, 1
+local R0, L = 5, 5
+local hp = Vector3.zero
+local heading = 0
+local trail = {}
+local jS = {}               -- per joint spring state (offset x,y,z + velocity)
+local jp = {}               -- final joint positions
+local bur, burV = 1.0, 0    -- burial: 0 = lying on the sand, 1 = half buried, 1.8 = hidden
+local mouth, mouthV = 0.15, 0
+local curSp = 0
+local wavePh = 0
+local rippleT, rippleA = 99, 0
+local gy1, restY1 = 0, 0
+local lungeCd = 0
+local act, hunt, control, dive = nil, nil, false, false
+local ride = false
+local shake, fovKick, baseFov, impact = 0, 0, 70, 0
+local avatarCF, avatarSaved = nil, {}
+local statusLbl, noticeUntil = nil, 0
+local conns = {}
+local errT = 0
+local lostSet, lostT, radT = {}, 0, 0
+local guardT, threats = 0, {}
+local oldZoomMax, oldZoomMin
+local controls
+local groundP = RaycastParams.new()
+groundP.FilterType = Enum.RaycastFilterType.Exclude
+groundP.RespectCanCollide = true
+
+pcall(function()
+	controls = require(lp:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 3)):GetControls()
+end)
+
+local function notify(txt, secs)
+	if statusLbl then statusLbl.Text = txt end
+	noticeUntil = os.clock() + (secs or 3)
+end
+local function refChar(c)
+	char = c
+	hrp = c:WaitForChild("HumanoidRootPart")
+	hum = c:WaitForChild("Humanoid")
+end
+refChar(lp.Character or lp.CharacterAdded:Wait())
+
+local function lerp(a, b, t) return a + (b - a) * t end
+local function clamp(x, a, b) return math.clamp(x, a, b) end
+local function smooth(x) x = clamp(x, 0, 1); return x * x * (3 - 2 * x) end
+local function adiff(a, b) return (a - b + math.pi) % TAU - math.pi end
+local function mix(a, b, k) return a + (b - a) * k end
+local function ramp(t, a, b) return smooth((t - a) / (b - a)) end
+local function sp(x, v, target, w, z, dt) -- damped spring: gives overshoot / follow-through
+	local a = w * w * (target - x) - 2 * z * w * v
+	v += a * dt
+	x += v * dt
+	return x, v
+end
+
+-- avatar rides inside the body (so the bricks keep belonging to you) -------------------------------
+local function carryAvatar(on)
+	if on then
+		pcall(function() hrp.Anchored = false end)
+		pcall(function() hum.PlatformStand = true end)
+		avatarSaved = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") then avatarSaved[d] = d.CanCollide; d.CanCollide = false end
+		end
+		pcall(function()
+			local old = hrp:FindFirstChild("WormAvatarAntiG")
+			if old then old:Destroy() end
+			local bf = Instance.new("BodyForce")
+			bf.Name = "WormAvatarAntiG"
+			bf.Force = Vector3.new(0, hrp.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = hrp
+		end)
+	else
+		pcall(function() local bf = hrp:FindFirstChild("WormAvatarAntiG"); if bf then bf:Destroy() end end)
+		for d, c in pairs(avatarSaved) do pcall(function() d.CanCollide = c end) end
+		avatarSaved = {}
+		pcall(function() hum.PlatformStand = false end)
+		pcall(function() hrp.Anchored = false end)
+		pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+	end
+end
+local function setRide(on)
+	if on == ride then return end
+	ride = on
+	carryAvatar(on)
+	if on then
+		cam.CameraSubject = camPart
+		lp.CameraMaxZoomDistance = 3000
+		lp.CameraMinZoomDistance = clamp(3.5 * R0, 12, 2900)
+	else
+		pcall(function() hrp.CFrame = CFrame.new(hp.X, gy1 + 8, hp.Z) end)
+		avatarCF = nil
+		cam.CameraSubject = hum
+		if oldZoomMax then lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance = oldZoomMax, oldZoomMin end
+	end
+end
+
+-- bricks (same selection as the other scripts, with public-server support) ----------------------------
+
+local function toPart(o)
+	if not o then return nil end
+	if o:IsA("BasePart") then return o end
+	return o:FindFirstChildWhichIsA("BasePart", true)
+end
+local function collect(container, from, to)
+	local kids, out, seen = container:GetChildren(), {}, {}
+	for i = from, math.min(to, #kids) do
+		local p = toPart(kids[i])
+		if p and not seen[p] then seen[p] = true; out[#out + 1] = p end
+	end
+	return out
+end
+-- who owns this brick? true = me, false = someone else, nil = unknown (attributes / value objects / folder named after a player)
+local function ownerState(p)
+	local function match(v)
+		if v == nil then return nil end
+		if typeof(v) == "Instance" then v = v.Name end
+		if type(v) == "number" then return v == lp.UserId end
+		v = tostring(v):lower()
+		return v == lp.Name:lower() or v == lp.DisplayName:lower() or v == tostring(lp.UserId)
+	end
+	local inst = p
+	for _ = 1, 4 do
+		if not inst or inst == workspace then break end
+		for _, nm in ipairs({"Owner", "owner", "Creator", "creator", "Player", "Builder"}) do
+			local a = inst:GetAttribute(nm)
+			if a ~= nil then return match(a) end
+			local c = inst:FindFirstChild(nm)
+			if c and c:IsA("ValueBase") then return match(c.Value) end
+		end
+		local pl = Players:FindFirstChild(inst.Name)
+		if pl and pl:IsA("Player") then return pl == lp end
+		inst = inst.Parent
+	end
+	return nil
+end
+local function usable(p, rep)
+	if not p or not p.Parent or p:IsDescendantOf(char) then return false end
+	if p.Anchored then rep.anchored += 1 return false end
+	local okJ, joints = pcall(function() return p:GetJoints() end)
+	if okJ and #joints > 0 then rep.welded += 1 return false end
+	if ownerState(p) == false then rep.notOwned += 1 return false end
+	if isnetworkowner then
+		local okO, own = pcall(isnetworkowner, p)
+		if okO and not own then rep.notOwned += 1 return false end
+	end
+	rep.ok += 1
+	return true
+end
+-- public servers: the first bricks of workspace.Bricks belong to other players, so scan for OUR bricks (nearest first)
+local function scanMine(root)
+	local list = {}
+	local tmp = {anchored = 0, welded = 0, notOwned = 0, ok = 0}
+	local base = hrp.Position
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") and not d:IsDescendantOf(char) and (not CFG.Strict or usable(d, tmp)) then
+			list[#list + 1] = {d, (d.Position - base).Magnitude, ownerState(d) == true and 0 or 1}
+		end
+	end
+	table.sort(list, function(x, y)
+		if x[3] ~= y[3] then return x[3] < y[3] end
+		return x[2] < y[2]
+	end)
+	local out = {}
+	for i = CFG.From, math.min(CFG.To, #list) do out[#out + 1] = list[i][1] end
+	return out
+end
+local function gather()
+	local root = workspace:FindFirstChild("Bricks")
+	if not root then return nil end
+	local function attempt(ranged)
+		local rep = {anchored = 0, welded = 0, notOwned = 0, ok = 0, total = 0}
+		local out, seen, parents = {}, {}, {}
+		local function consider(p)
+			if p and not seen[p] and #out < CFG.Want then
+				seen[p] = true
+				rep.total += 1
+				if not CFG.Strict then rep.ok += 1; out[#out + 1] = p
+				elseif usable(p, rep) then out[#out + 1] = p end
+			end
+		end
+		for _, p in ipairs(ranged) do parents[p.Parent] = true; consider(p) end
+		if #out < CFG.Want then
+			local extra = {}
+			for par in pairs(parents) do
+				for _, d in ipairs(par:GetChildren()) do
+					if d:IsA("BasePart") and not seen[d] then extra[#extra + 1] = d end
+				end
+			end
+			table.sort(extra, function(x, y) return (x.Position - hrp.Position).Magnitude < (y.Position - hrp.Position).Magnitude end)
+			for _, p in ipairs(extra) do
+				if #out >= CFG.Want then break end
+				consider(p)
+			end
+		end
+		return out, rep
+	end
+	local mine = root:FindFirstChild(lp.Name)
+	local ranged = mine and collect(mine, CFG.From, CFG.To) or collect(root, CFG.From, CFG.To)
+	if #ranged == 0 then
+		local sub = root:FindFirstChild("master_ofbuilds")
+		if sub then ranged = collect(sub, CFG.From, CFG.To) end
+	end
+	local out, rep = attempt(ranged)
+	if #out < CFG.MinBricks then
+		local alt = scanMine(root)
+		if #alt > 0 then
+			local out2, rep2 = attempt(alt)
+			if #out2 > #out then return out2, rep2 end
+		end
+	end
+	return out, rep
+end
+
+
+
+-- colors (LOCAL ONLY): sandy segmented body, bone teeth ------------------------------------------
+local function paint(p, c, mat)
+	pcall(function() p.Color = c; p.Material = mat or Enum.Material.SmoothPlastic end)
+end
+local function applyColors()
+	local TOOTH = Color3.fromRGB(238, 232, 210)
+	local SAND1, SAND2, DARK = Color3.fromRGB(196, 160, 104), Color3.fromRGB(168, 128, 80), Color3.fromRGB(120, 86, 52)
+	for i, ring in ipairs(P.ring or {}) do
+		local c = (i <= 3) and DARK or ((i % 2 == 0) and SAND1 or SAND2)
+		for _, p in ipairs(ring) do paint(p, c) end
+	end
+	for _, tooth in ipairs(P.tooth or {}) do
+		for _, p in ipairs(tooth) do paint(p, TOOTH) end
+	end
+end
+
+local function groundAt(p, h)
+	local res = workspace:Raycast(p + Vector3.new(0, h, 0), Vector3.new(0, -(h + 3000), 0), groundP)
+	return res and res.Position.Y or p.Y
+end
+local function refreshFilters()
+	local f = {char}
+	if camPart then f[#f + 1] = camPart end
+	for _, p in ipairs(pool) do f[#f + 1] = p end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then f[#f + 1] = pl.Character end
+	end
+	groundP.FilterDescendantsInstances = f
+end
+
+-- dust (LOCAL particles) ---------------------------------------------------------------------------
+local fxPart, dust
+local function makeDust()
+	fxPart = Instance.new("Part")
+	fxPart.Anchored, fxPart.CanCollide, fxPart.CanQuery, fxPart.CanTouch, fxPart.Transparency, fxPart.Size = true, false, false, false, 1, Vector3.one
+	fxPart.Parent = workspace
+	pcall(function()
+		dust = Instance.new("ParticleEmitter")
+		dust.Texture = "rbxasset://textures/particles/smoke_main.dds"
+		dust.Color = ColorSequence.new(Color3.fromRGB(214, 182, 128))
+		dust.Lifetime = NumberRange.new(1.2, 2.6)
+		dust.Rate = 0
+		dust.SpreadAngle = Vector2.new(40, 40)
+		dust.Rotation = NumberRange.new(0, 360)
+		dust.RotSpeed = NumberRange.new(-60, 60)
+		dust.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.45), NumberSequenceKeypoint.new(1, 1)})
+		dust.LightEmission = 0
+		dust.Parent = fxPart
+	end)
+end
+local function dustSize()
+	if not dust then return end
+	pcall(function()
+		dust.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, R0 * 0.25), NumberSequenceKeypoint.new(1, R0 * 0.9)})
+		dust.Speed = NumberRange.new(R0 * 1.0, R0 * 3.0)
+		dust.Acceleration = Vector3.new(0, -workspace.Gravity * 0.15, 0)
+	end)
+end
+local function burst(n)
+	if dust then pcall(function() dust:Emit(n) end) end
+end
+
+-- brick roles: rings (body) + teeth (mouth) --------------------------------------------------------
+local function dims()
+	R0 = 1.4 * Kb * CFG.Size
+	L = 0.95 * Kb * CFG.Size
+end
+local function allocate()
+	local N = #pool
+	dims()
+	local teethTarget = clamp(math.floor(N * 0.22), 12, 600)
+	local body = N - teethTarget
+	nSeg = 21
+	local M = clamp(math.ceil(L / (Kb * 0.95)), 1, 64) -- slats per segment (keeps the body solid at big sizes)
+	local K = math.floor(body / (nSeg * M))
+	if K < 3 then
+		M = math.max(1, math.floor(body / (nSeg * 3)))
+		K = math.floor(body / (nSeg * M))
+		if K < 3 then
+			nSeg = math.max(4, math.floor(body / (3 * M)))
+			K = math.max(3, math.floor(body / (nSeg * M)))
+		end
+	end
+	segM, segK = M, K
+	local idx = 0
+	P = {ring = {}, tooth = {}}
+	for i = 1, nSeg do
+		local r = {}
+		for t = 1, M * K do idx += 1; r[t] = pool[idx] end
+		P.ring[i] = r
+	end
+	local left = N - idx
+	local Tn = clamp(math.floor(R0 * 0.45 / (Kb * 0.95) + 0.5), 1, 10) -- bricks per tooth (long teeth at big sizes)
+	local Tc = math.floor(left / Tn)
+	if Tc < 6 then Tn = 1; Tc = left end
+	for k = 1, Tc do
+		local th = {}
+		for t = 1, Tn do idx += 1; th[t] = pool[idx] end
+		P.tooth[k] = th
+	end
+	while idx < N do
+		idx += 1
+		P.tooth[#P.tooth + 1] = {pool[idx]}
+	end
+	jS = {}
+	for i = 1, nSeg do jS[i] = {x = 0, y = 0, z = 0, vx = 0, vy = 0, vz = 0} end
+	dustSize()
+end
+
+-- cutscene state ---------------------------------------------------------------------------
+local cut = nil
+local cutHooks = {begin = function() end, finish = function() end}
+local function startCut()
+	if cut then return end
+	cut = {ws = hum.WalkSpeed, jp = hum.JumpPower}
+	pcall(function() hum.WalkSpeed = 0; hum.JumpPower = 0 end)
+	cam.CameraType = Enum.CameraType.Scriptable
+	cutHooks.begin()
+end
+local function endCut()
+	if not cut then return end
+	local c = cut
+	cut = nil
+	pcall(function() hum.WalkSpeed = c.ws; hum.JumpPower = c.jp end)
+	cam.CameraType = Enum.CameraType.Custom
+	pcall(function() cam.FieldOfView = baseFov end)
+	cam.CameraSubject = hum
+	cutHooks.finish()
+end
+
+-- dismiss / summon ---------------------------------------------------------------
+local function dismiss()
+	endCut()
+	setRide(false)
+	for _, s in ipairs(saved) do
+		local p = s.p
+		if p and p.Parent then
+			pcall(function()
+				local bf = p:FindFirstChild("WormAntiG")
+				if bf then bf:Destroy() end
+				p.CFrame = s.cf
+				p.Anchored = s.anchored
+				p.CanCollide = s.collide
+				p.Color, p.Material = s.color, s.material
+				p.AssemblyLinearVelocity = Vector3.zero
+			end)
+		end
+	end
+	if camPart then camPart:Destroy() end
+	if fxPart then fxPart:Destroy() end
+	camPart, fxPart, dust = nil, nil, nil
+	pool, P = {}, {}
+	saved, orient, targets = {}, {}, {}
+	lastPos, driftBad = {}, {}
+	alive, control, dive = false, false, false
+	act, hunt = nil, nil
+	avatarCF = nil
+	pcall(function() cam.FieldOfView = baseFov end)
+	cam.CameraSubject = hum
+end
+
+local function summon()
+	if alive then return end
+	local list, rep = gather()
+	if not list then
+		notify("✘ workspace.Bricks not found")
+		return
+	end
+	local N = #list
+	if N < CFG.MinBricks then
+		notify(string.format("✘ Need %d+ bricks that can replicate, found %d (of %d checked): %d anchored, %d welded, %d not yours. (Public server: stand next to your own bricks.)",
+			CFG.MinBricks, N, rep.total, rep.anchored, rep.welded, rep.notOwned), 9)
+		return
+	end
+	pool = list
+	saved, orient, targets = {}, {}, {}
+	lastPos, driftBad = {}, {}
+	local sumLong, sumMid = 0, 0
+	for i, p in ipairs(pool) do
+		saved[i] = {p = p, cf = p.CFrame, anchored = p.Anchored, collide = p.CanCollide, color = p.Color, material = p.Material}
+		local s = p.Size
+		local mx, mn = math.max(s.X, s.Y, s.Z), math.min(s.X, s.Y, s.Z)
+		sumLong += mx
+		sumMid += s.X + s.Y + s.Z - mx - mn
+		if s.X == mx and s.X > s.Y then orient[p] = CFrame.Angles(0, 0, math.pi / 2)
+		elseif s.Z == mx and s.Z > s.Y then orient[p] = CFrame.Angles(-math.pi / 2, 0, 0)
+		else orient[p] = CFrame.new() end
+		pcall(function() p.Anchored = false; p.CanCollide = false end)
+		pcall(function()
+			local bf = Instance.new("BodyForce")
+			bf.Name = "WormAntiG"
+			bf.Force = Vector3.new(0, p.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = p
+		end)
+	end
+	Kb = clamp(sumLong / N, 1, 20)
+	Tb = clamp(sumMid / N, 0.3, 10)
+	pcall(function() lp.MaximumSimulationRadius = math.huge end)
+	pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+
+	camPart = Instance.new("Part")
+	camPart.Anchored, camPart.CanCollide, camPart.Transparency, camPart.Size, camPart.CanQuery = true, false, 1, Vector3.one, false
+	camPart.Parent = workspace
+	makeDust()
+	refreshFilters()
+	allocate()
+
+	oldZoomMax, oldZoomMin = lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance
+	baseFov = cam.FieldOfView
+	-- it erupts in front of you, facing you
+	local look = hrp.CFrame.LookVector
+	look = Vector3.new(look.X, 0, look.Z)
+	look = look.Magnitude > 1e-3 and look.Unit or Vector3.new(0, 0, -1)
+	heading = math.atan2(look.X, look.Z)
+	local stopPt = hrp.Position + look * (3 * R0 + 12)
+	local start = hrp.Position + look * (10 * R0 + 40)
+	gy1 = groundAt(Vector3.new(start.X, hrp.Position.Y, start.Z), 40)
+	hp = Vector3.new(start.X, 0, start.Z)
+	local F = Vector3.new(-math.sin(heading), 0, -math.cos(heading))
+	trail = {}
+	local step0 = L / 3
+	for i = 1, 3 * nSeg + 6 do
+		trail[i] = Vector3.new(hp.X - F.X * step0 * i, 0, hp.Z - F.Z * step0 * i)
+	end
+	bur, burV, mouth, mouthV, curSp, wavePh = 1.8, 0, 0.1, 0, 0, 0
+	rippleT, rippleA, lungeCd, impact, shake, fovKick = 99, 0, 0, 0, 0, 0
+	control, dive, act, hunt = false, false, nil, nil
+	alive = true
+	applyColors()
+	act = {name = "emerge", t = 0, dur = 9.6, hit = false, stop = Vector3.new(stopPt.X, 0, stopPt.Z), p0 = hrp.Position, look = look,
+		gyp = groundAt(hrp.Position, 4)}
+	startCut()
+	notify(string.format("%d bricks • %d segments • size %.1fx", N, nSeg, CFG.Size), 6)
+end
+
+-- rig helpers --------------------------------------------------------------
+local function place(p, cf)
+	if not p then return end
+	targets[p] = cf * orient[p]
+end
+local function alongDir(c, dir)
+	local up = (math.abs(dir.Y) > 0.95) and Vector3.xAxis or Vector3.yAxis
+	local x = up:Cross(dir)
+	x = x.Magnitude > 1e-4 and x.Unit or Vector3.xAxis
+	return CFrame.fromMatrix(c, x, dir)
+end
+local function applyTargets()
+	for p, cf in pairs(targets) do
+		if p.Parent then
+			p.CFrame = cf
+			p.AssemblyLinearVelocity = Vector3.zero
+			p.AssemblyAngularVelocity = Vector3.zero
+			lastPos[p] = cf.Position
+		end
+	end
+	if avatarCF and ride and hrp and hrp.Parent then
+		hrp.CFrame = avatarCF
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
+end
+local function checkDrift()
+	local lim = 0.6 * Kb + 0.002 * R0
+	for p, wrote in pairs(lastPos) do
+		if p.Parent then
+			local d = (p.Position - wrote).Magnitude
+			local n = driftBad[p] or 0
+			driftBad[p] = d > lim and math.min(10, n + 1) or math.max(0, n - 1)
+		end
+	end
+end
+local function visibleCount()
+	local n, owned = 0, 0
+	for _, p in ipairs(pool) do
+		n += 1
+		local good = (driftBad[p] or 0) < 3
+		if good and isnetworkowner then
+			local ok, o = pcall(isnetworkowner, p)
+			if ok and not o then good = false end
+		end
+		if good then owned += 1 end
+	end
+	return owned, n
+end
+
+-- trail (follow-the-leader path of the head) -----------------------------------------------------
+local function pushTrail(p)
+	local last = trail[1]
+	if not last or (p - last).Magnitude >= L / 3 then
+		table.insert(trail, 1, p)
+		local maxN = 3 * nSeg + 6
+		while #trail > maxN do table.remove(trail) end
+	end
+end
+local function sampleTrail(n)
+	local out = {}
+	local j, acc, prev = 1, 0, Vector3.new(hp.X, 0, hp.Z)
+	for _, pt in ipairs(trail) do
+		local seg = (pt - prev).Magnitude
+		while j <= n and (j - 1) * L <= acc + seg do
+			local a = ((j - 1) * L - acc) / math.max(seg, 1e-6)
+			out[j] = prev:Lerp(pt, clamp(a, 0, 1))
+			j += 1
+		end
+		acc += seg
+		prev = pt
+		if j > n then break end
+	end
+	while j <= n do out[j] = prev; j += 1 end
+	return out
+end
+
+-- players / input ------------------------------------------------------------------
+local function targetHrp(pl)
+	local c = pl and pl.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function findPlayer(txt)
+	txt = string.lower(txt or "")
+	txt = txt:match("^%s*(.-)%s*$")
+	if txt == "" then return nil end
+	local partial
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp then
+			local n, d = pl.Name:lower(), pl.DisplayName:lower()
+			if n == txt or d == txt then return pl end
+			if not partial and (n:sub(1, #txt) == txt or d:sub(1, #txt) == txt) then partial = pl end
+		end
+	end
+	return partial
+end
+local function getMove()
+	local mv
+	if controls then
+		local ok, v = pcall(function() return controls:GetMoveVector() end)
+		if ok then mv = v end
+	end
+	if mv then
+		local w = cam.CFrame:VectorToWorldSpace(Vector3.new(mv.X, 0, mv.Z))
+		w = Vector3.new(w.X, 0, w.Z)
+		if w.Magnitude > 0.01 then return w.Unit * math.min(1, mv.Magnitude) end
+		return Vector3.zero
+	end
+	local d = hum.MoveDirection
+	return Vector3.new(d.X, 0, d.Z)
+end
+local function parseSize(txt)
+	local s = (string.lower(txt or ""):gsub("[%sx×]", ""))
+	local n = tonumber(s)
+	if not n then return nil end
+	return clamp(n, 0.2, 1000)
+end
+
+-- abilities (every one: anticipation -> action -> follow-through) ------------------------------
+local function hit(a, power, n)
+	a.hit = true
+	shake = math.max(shake, power)
+	fovKick = math.max(fovKick, power * 0.35)
+	impact = 1
+	rippleT, rippleA = 0, 1
+	burst(n)
+end
+local function roarPose(g, t, F)
+	local dip = math.sin(math.pi * clamp(t / 0.4, 0, 1)) -- inhale dip (anticipation)
+	local up = ramp(t, 0.35, 1.0) * (1 - ramp(t, 2.5, 3.2))
+	g.D = Vector3.new(0, 2.2 * R0 * up - 0.25 * R0 * dip, 0) - F * (0.6 * R0 * up)
+	g.span = 0.5
+	g.mouth = mix(0.08, 1.0, up) + 0.06 * up * math.sin(os.clock() * 30)
+	g.idleW = 0.15
+	if up > 0.6 then
+		shake = math.max(shake, 1.0 * up)
+		fovKick = math.max(fovKick, 0.8 * up)
+	end
+end
+local function startAct(name, extra)
+	if not alive then return false end
+	if act then notify("Busy: " .. act.name, 2) return false end
+	local durs = {roar = 3.2, slam = 3.0, lunge = 3.4}
+	act = {name = name, t = 0, dur = durs[name] or 3, hit = false}
+	if extra then for k, v in pairs(extra) do act[k] = v end end
+	return true
+end
+local function applyAct(g, a, dt, F)
+	local t = a.t
+	if a.name == "emerge" then
+		-- CUTSCENE: 0-3.6 swims in under the sand | 3.4-4.3 coils (anticipation) | 4.3 ERUPTS | 4.5-7.7 roar | settles
+		if t < 3.4 then g.bur = 1.35
+		elseif t < 4.3 then g.bur = mix(1.35, 1.65, ramp(t, 3.4, 4.3))
+		else g.bur = mix(0.9, 1.0, ramp(t, 7.0, 8.0)) end
+		if t < 4.3 then shake = math.max(shake, 0.25 + 0.9 * ramp(t, 0.3, 3.4)) end
+		local coil = ramp(t, 3.3, 4.3)
+		g.D = (-F * 0.3 * R0 + Vector3.new(0, 0.35 * R0, 0)) * coil
+		g.span, g.idleW = 0.5, 0.2
+		if t >= 4.3 and not a.hit then hit(a, 4, 260) end
+		if t >= 4.5 then roarPose(g, t - 4.5, F) end
+	elseif a.name == "roar" then
+		roarPose(g, t, F)
+	elseif a.name == "slam" then
+		if a.pl and t < 1.0 then
+			local th = targetHrp(a.pl)
+			if th then
+				local flat = Vector3.new(th.Position.X - hp.X, 0, th.Position.Z - hp.Z)
+				if flat.Magnitude > 1e-3 then heading += adiff(math.atan2(-flat.X, -flat.Z), heading) * math.min(1, dt * 5) end
+			end
+		end
+		local rise = ramp(t, 0.15, 1.0)
+		local slam = ramp(t, 1.15, 1.3)
+		local dip = math.sin(math.pi * clamp(t / 0.3, 0, 1))
+		local D = Vector3.new(0, 3.0 * R0 * rise - 0.3 * R0 * dip, 0) - F * (0.7 * R0 * rise)
+		local sm = Vector3.new(0, -0.1 * R0, 0) + F * (1.3 * R0)
+		D = D * (1 - slam) + sm * slam
+		g.D, g.span, g.idleW = D, 0.45, 0.15
+		g.mouth = mix(0.1, 0.9, rise) * (1 - slam) + 0.1 * slam
+		if slam > 0.5 then g.snap = true end
+		if t >= 1.3 and not a.hit then hit(a, 3.5, 100) end
+	elseif a.name == "lunge" then
+		if a.pl and t < 0.9 then
+			local th = targetHrp(a.pl)
+			if th then a.tp = th.Position end
+		end
+		if not a.tp then a.tp = Vector3.new(hp.X, gy1, hp.Z) + F * (3 * R0) + Vector3.new(0, 0.3 * R0, 0) end
+		if t < 0.9 then
+			local flat = Vector3.new(a.tp.X - hp.X, 0, a.tp.Z - hp.Z)
+			if flat.Magnitude > 1e-3 then heading += adiff(math.atan2(-flat.X, -flat.Z), heading) * math.min(1, dt * 5) end
+		end
+		local delta = Vector3.new(a.tp.X - hp.X, 0, a.tp.Z - hp.Z)
+		local reach = 4.4 * R0
+		local dxz = (delta.Magnitude > reach) and (delta.Unit * reach) or delta
+		local Dy = (a.tp.Y + 0.3 * R0) - restY1
+		local arc = clamp(0.45 * dxz.Magnitude, R0, 3 * R0)
+		-- 1) anticipation: pull back and coil   2) launch (ease-out arc)   3) bite   4) recover
+		local ant = (-F * 0.7 * R0 + Vector3.new(0, 0.5 * R0, 0)) * ramp(t, 0, 0.9)
+		local u2 = clamp((t - 0.9) / 0.45, 0, 1)
+		local e = 1 - (1 - u2) ^ 3
+		local launch = Vector3.new(dxz.X * e, Dy * e + arc * math.sin(math.pi * u2), dxz.Z * e)
+		local D = ant * (1 - e) + launch
+		g.D = D * (1 - ramp(t, 2.3, 3.3))
+		g.span, g.idleW = 0.6, 0.1
+		if t < 0.9 then g.mouth = mix(0.12, 0.0, ramp(t, 0, 0.5))
+		elseif t < 1.4 then g.mouth = 1.0
+		else
+			g.mouth = mix(0.0, 0.12, ramp(t, 2.4, 3.2))
+			g.snap = t < 1.9
+		end
+		if t >= 1.4 and not a.hit then hit(a, 2.5, 70) end
+	end
+end
+
+-- nearest worm brick to a point (used by the guard) ---------------------------------------------
+local function nearestBrickPos(pt, i)
+	local bestP, bestD = nil, math.huge
+	for ii = math.max(1, i - 1), math.min(nSeg, i + 1) do
+		for _, b in ipairs(P.ring[ii]) do
+			local cf = targets[b]
+			if cf then
+				local d = (cf.Position - pt).Magnitude
+				if d < bestD then bestD, bestP = d, cf.Position end
+			end
+		end
+	end
+	if i <= 2 then
+		for _, th in ipairs(P.tooth) do
+			for _, b in ipairs(th) do
+				local cf = targets[b]
+				if cf then
+					local d = (cf.Position - pt).Magnitude
+					if d < bestD then bestD, bestP = d, cf.Position end
+				end
+			end
+		end
+	end
+	return bestP
+end
+
+-- CUTSCENE CAMERA: low tracking shot -> dip -> eruption tilt-up + FOV punch -> hero orbit -> crane pull-back -> hand-off
+local function cutsceneCamera(a, pf, dt)
+	local t = a.t
+	local S = math.max(R0, 6)
+	local look, gyp = a.look, a.gyp
+	local up = Vector3.new(0, 1, 0)
+	local headC = pf[1] + Vector3.new(0, 0.4 * R0, 0)
+	local k = smooth(math.min(t, 3.4) / 3.4)
+	local PA = a.p0 - look * (0.4 * S + 3) + look * (1.0 * S * k)
+	PA = Vector3.new(PA.X, gyp + 0.12 * S + 1.4, PA.Z)
+	local pos, fov, target
+	if t < 4.3 then
+		local kb = ramp(t, 3.4, 4.3)
+		pos = Vector3.new(PA.X, mix(PA.Y, gyp + 0.04 * S + 0.6, kb), PA.Z)
+		fov = mix(mix(62, 50, ramp(t, 0, 3.4)), 42, kb)
+		target = headC + Vector3.new(0, mix(0.2, 0.5, kb) * S, 0)
+	elseif t < 5.2 then
+		local kc = ramp(t, 4.3, 5.2)
+		pos = Vector3.new(PA.X, gyp + 0.04 * S + 0.6, PA.Z) - look * (0.5 * S * kc) -- recoil
+		fov = mix(42, 58, kc) + 30 * math.exp(-(t - 4.3) * 5) -- FOV punch on the eruption
+		target = headC
+	else
+		if not a.camC then
+			a.camC = a.lastPos or PA
+			local hg = Vector3.new(pf[1].X, gyp, pf[1].Z)
+			local v = Vector3.new(a.camC.X - hg.X, 0, a.camC.Z - hg.Z)
+			a.r0, a.ang0, a.h0 = math.max(v.Magnitude, 1), math.atan2(v.Z, v.X), a.camC.Y - gyp
+		end
+		local hg = Vector3.new(pf[1].X, gyp, pf[1].Z)
+		local kd, ke = ramp(t, 5.2, 7.6), ramp(t, 7.6, 9.2)
+		local ang = a.ang0 + 1.3 * kd + 0.5 * ke
+		local r = mix(mix(a.r0, 2.6 * S, kd), 6 * S, ke)
+		local h = mix(mix(a.h0, 1.2 * S, kd), 2.8 * S, ke)
+		pos = hg + Vector3.new(math.cos(ang) * r, h, math.sin(ang) * r)
+		fov = mix(mix(58, 52, kd), 68, ke)
+		local bodyP = pf[math.max(2, math.ceil(nSeg / 3))]
+		target = headC:Lerp(bodyP, ke * 0.6)
+		local kk = ramp(t, 8.9, 9.6) -- hand the camera over to the normal worm camera
+		if kk > 0 then
+			local F = Vector3.new(-math.sin(heading), 0, -math.cos(heading))
+			local camPartPos = pf[1] + Vector3.new(0, 1.2 * R0, 0)
+			pos = pos:Lerp(camPartPos - F * (3.6 * R0) + Vector3.new(0, 0.3 * R0, 0), kk)
+			fov = mix(fov, baseFov, kk)
+			target = target:Lerp(camPartPos, kk)
+		end
+	end
+	a.lastPos = pos
+	local off = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * shake * S * 0.012
+	local cf = CFrame.lookAt(pos + off, target) * CFrame.Angles(0, 0, math.sin(t * 23) * 0.004 * shake)
+	cam.CFrame = cf
+	cam.FieldOfView = clamp(fov + 10 * fovKick, 20, 110)
+end
+
+-- main step ----------------------------------------------------------------
+local function step(dt)
+	local t = os.clock()
+	dims()
+	local speed = math.min(600, 14 + 14 * CFG.Size ^ 0.9)
+	local F = Vector3.new(-math.sin(heading), 0, -math.cos(heading))
+
+	gy1 = groundAt(Vector3.new(hp.X, gy1, hp.Z), 6 * R0 + 30)
+	restY1 = gy1 + R0 * (1 - 1.35 * bur)
+	lungeCd = math.max(0, lungeCd - dt)
+
+	-- 1) where does it want to go (control / hunt)
+	local wantDir, tgtSp = nil, 0
+	if act and act.name == "emerge" then
+		if act.t > 0.2 and act.t < 3.6 and act.stop then
+			local flat = Vector3.new(act.stop.X - hp.X, 0, act.stop.Z - hp.Z)
+			local dist = flat.Magnitude
+			if dist > 1 then
+				wantDir = flat.Unit
+				tgtSp = clamp(dist / 0.9, 0, (7 * R0 + 28) / 2.4)
+			end
+		end
+	elseif not act then
+		if control then
+			local mv = getMove()
+			if mv.Magnitude > 0.1 then wantDir, tgtSp = mv.Unit, speed * math.min(1, mv.Magnitude) end
+		elseif hunt then
+			local th = targetHrp(hunt.pl)
+			local tHum = th and th.Parent and th.Parent:FindFirstChildOfClass("Humanoid")
+			if not th or not hunt.pl.Parent then
+				hunt = nil
+				notify("Target lost", 3)
+			elseif tHum and tHum.Health <= 0 then
+				hunt = nil
+				notify("Target down", 4)
+			else
+				local flat = Vector3.new(th.Position.X - hp.X, 0, th.Position.Z - hp.Z)
+				local dist = flat.Magnitude
+				local range = 3.6 * R0
+				if dist > 1e-3 then wantDir = flat.Unit end
+				if dist > range * 0.9 then tgtSp = speed * smooth((dist - range * 0.9) / (2 * R0) + 0.2) end -- slows as it arrives
+				if dist <= range and lungeCd <= 0 then startAct("lunge", {pl = hunt.pl}) end
+			end
+		end
+	end
+	if wantDir then
+		local d = adiff(math.atan2(-wantDir.X, -wantDir.Z), heading)
+		heading += clamp(d * math.min(1, dt * 3), -1.5 * dt, 1.5 * dt) -- the head leads the turn, the body follows
+	end
+
+	-- 2) ability / pose goals (anticipation -> action -> follow-through)
+	local g = {D = Vector3.zero, span = 0.5, mouth = 0.12 + 0.06 * math.sin(t * 1.3), bur = dive and 1.8 or 1.0, snap = false, idleW = 1}
+	if act then
+		act.t += dt
+		applyAct(g, act, dt, F)
+		if act.t >= act.dur then
+			if act.name == "lunge" then lungeCd = 1.0 end
+			act = nil
+		end
+	end
+	if cut and not (act and act.name == "emerge") then endCut() end
+	F = Vector3.new(-math.sin(heading), 0, -math.cos(heading))
+	local right = Vector3.new(-F.Z, 0, F.X)
+
+	-- 3) weighty movement: slow to accelerate, quicker to brake
+	curSp = curSp + (tgtSp - curSp) * math.min(1, dt * ((tgtSp > curSp) and 2.2 or 4))
+	if curSp > 0.2 then hp = hp + F * curSp * dt end
+	pushTrail(Vector3.new(hp.X, 0, hp.Z))
+
+	local sway = right * (math.sin(t * 0.7) * 0.25 * R0) + Vector3.new(0, math.sin(t * 1.1) * 0.12 * R0, 0)
+	local Dg = g.D + sway * g.idleW
+	bur, burV = sp(bur, burV, g.bur + impact * 0.35, 7, 0.7, dt)
+	mouth, mouthV = sp(mouth, mouthV, g.mouth, g.snap and 34 or 14, g.snap and 0.45 or 0.8, dt)
+	local mf = clamp(curSp / math.max(speed, 1), 0, 1)
+	wavePh += (curSp / L * 0.5 + 0.8) * dt -- wave speed matches ground speed, so the body does not skate
+	rippleT += dt
+	rippleA = rippleA * math.exp(-1.6 * dt)
+
+	-- 4) body joints: follow the head's path, springs give overlap / sag, wave gives the slither
+	local xz = sampleTrail(nSeg)
+	local pj = {}
+	for i = 1, nSeg do
+		local s = (i - 1) / math.max(nSeg - 1, 1)
+		local q = xz[i]
+		local gi = groundAt(Vector3.new(q.X, gy1, q.Z), 6 * R0 + 30)
+		local Ri = R0 * (1 - 0.55 * s ^ 1.3)
+		Ri = Ri * (1 + 0.06 * math.sin(t * 2.2 - i * 0.7) + rippleA * 0.35 * math.exp(-((i - rippleT * 12) ^ 2) / 5))
+		local fall = math.max(0, 1 - s / math.max(g.span, 0.05)) ^ 1.6
+		local w = 24 * (1 - 0.8 * s) + 3 -- stiff head, loose tail = natural lag
+		local J = jS[i]
+		J.x, J.vx = sp(J.x, J.vx, Dg.X * fall, w, 0.65, dt)
+		J.y, J.vy = sp(J.y, J.vy, Dg.Y * fall, w, 0.65, dt)
+		J.z, J.vz = sp(J.z, J.vz, Dg.Z * fall, w, 0.65, dt)
+		local vert = 0.12 * R0 * mf * smooth(s * 3) * math.sin(wavePh - i * 0.5 + 1.6)
+		pj[i] = {Vector3.new(q.X + J.x, gi + Ri * (1 - 1.35 * bur) + J.y + vert, q.Z + J.z), Ri}
+	end
+	local pf = {}
+	for i = 1, nSeg do
+		local a, b = pj[math.max(i - 1, 1)][1], pj[math.min(i + 1, nSeg)][1]
+		local th = Vector3.new(a.X - b.X, 0, a.Z - b.Z)
+		local pos = pj[i][1]
+		if th.Magnitude > 1e-4 then
+			th = th.Unit
+			local s = (i - 1) / math.max(nSeg - 1, 1)
+			local lat = R0 * (0.18 + 0.55 * mf) * smooth(s * 3) * math.sin(wavePh - i * 0.5)
+			pos = pos + Vector3.new(-th.Z, 0, th.X) * lat
+		end
+		pf[i] = pos
+	end
+
+	-- 5) place the bricks: body rings (slats around the spine) ...
+	local Ts, Xs, Ys = {}, {}, {}
+	local M, Kk = segM, segK
+	for i = 1, nSeg do
+		local v = pf[math.max(i - 1, 1)] - pf[math.min(i + 1, nSeg)]
+		local T = (v.Magnitude > 1e-4) and v.Unit or F
+		local X = T:Cross(Vector3.yAxis)
+		X = (X.Magnitude > 1e-3) and X.Unit or Vector3.xAxis
+		local Y = X:Cross(T)
+		Ts[i], Xs[i], Ys[i] = T, X, Y
+		local ring = P.ring[i]
+		local Pi, Rr = pf[i], pj[i][2]
+		local phi0 = i * 0.45 + 0.3 * math.sin(t * 1.2 - i * 0.3) -- slow writhing twist
+		for tt = 1, #ring do
+			local m = (tt - 1) % M
+			local jj = math.floor((tt - 1) / M)
+			local off = ((m + 0.5) / M - 0.5) * L
+			local phi = phi0 + jj / Kk * TAU + (m % 2) * (0.5 / Kk) * TAU
+			local c = Pi + T * off + (X * math.cos(phi) + Y * math.sin(phi)) * Rr
+			place(ring[tt], alongDir(c, T))
+		end
+	end
+	-- ... and the mouth: rings of teeth that flare open / snap shut
+	local T1, X1, Y1 = Ts[1], Xs[1], Ys[1]
+	local mc = pf[1] + T1 * (0.5 * L)
+	local nT = #P.tooth
+	local rings = clamp(math.floor(math.sqrt(nT / 6)), 2, 8)
+	local per = math.ceil(nT / rings)
+	local bl = Kb * 0.95
+	for k, th in ipairs(P.tooth) do
+		local r = math.floor((k - 1) / per)
+		local j = (k - 1) % per
+		local ang = (j + r * 0.5) / per * TAU + ((r % 2 == 0) and 1 or -1) * t * (0.25 + 0.6 * mouth) * 0.5 -- gnashing
+		local radial = X1 * math.cos(ang) + Y1 * math.sin(ang)
+		local rim = R0 * 0.95 * (1 - 0.8 * r / rings)
+		local base = mc + radial * rim - T1 * (r * 0.25 * Kb)
+		local dir = (-radial) * (1 - 2 * mouth) + T1 * (0.6 + 0.4 * mouth)
+		dir = (dir.Magnitude > 1e-4) and dir.Unit or T1
+		for m = 1, #th do
+			place(th[m], alongDir(base + dir * ((m - 0.5) * bl), dir))
+		end
+	end
+
+	-- 6) avatar inside the body + anti-steal (take bricks back if another player grabs them)
+	avatarCF = CFrame.new(pf[math.ceil(nSeg / 2)])
+	radT += dt
+	if radT > 1 then
+		radT = 0
+		pcall(function() lp.MaximumSimulationRadius = math.huge end)
+		pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+	end
+	lostT += dt
+	if lostT > 0.2 then
+		lostT = 0
+		lostSet = {}
+		for _, p in ipairs(pool) do
+			local lost = (driftBad[p] or 0) >= 3
+			if isnetworkowner then
+				local okO, o = pcall(isnetworkowner, p)
+				if okO and not o then lost = true end
+			end
+			if lost then lostSet[p] = true end
+		end
+	end
+	-- GUARD: Roblox gives a brick to the closest player. When someone stands near the worm, park our hidden
+	-- avatar exactly on the worm brick nearest to that player (cycling if several are near), so we stay closest.
+	guardT += dt
+	if guardT > 0.1 then
+		guardT = 0
+		threats = {}
+		local near = 120 + 3 * R0
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= lp then
+				local th = targetHrp(pl)
+				if th then
+					local bi, bd = 1, math.huge
+					for i = 1, nSeg do
+						local d = (th.Position - pf[i]).Magnitude - pj[i][2]
+						if d < bd then bd, bi = d, i end
+					end
+					if bd < near then threats[#threats + 1] = {pl = pl, i = bi, d = bd} end
+				end
+			end
+		end
+		table.sort(threats, function(x, y) return x.d < y.d end)
+	end
+	if ride and #threats > 0 then
+		local k = (math.floor(os.clock() * 8) % #threats) + 1
+		local th = targetHrp(threats[k].pl)
+		if th then
+			local bp = nearestBrickPos(th.Position, threats[k].i)
+			if bp then avatarCF = CFrame.new(bp) end
+		end
+	elseif ride then
+		local n, sum = 0, Vector3.zero
+		for p in pairs(lostSet) do
+			local cf = targets[p]
+			if cf then
+				n += 1
+				sum += cf.Position
+			end
+		end
+		if n > 0 then avatarCF = CFrame.new(sum / n) end
+	end
+	setRide(not (act ~= nil and act.name == "emerge"))
+	if not ride then avatarCF = nil end
+
+	-- 7) camera, dust, decay
+	shake = math.max(0, shake - dt * 3)
+	fovKick = fovKick * math.exp(-3 * dt)
+	impact = impact * math.exp(-4 * dt)
+	pcall(function() cam.FieldOfView = baseFov + 14 * fovKick end)
+	camPart.Position = pf[1] + Vector3.new(0, 1.2 * R0, 0)
+		+ Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * shake * R0 * 0.02
+	fxPart.Position = Vector3.new(hp.X, gy1 + 2, hp.Z)
+	if dust then dust.Rate = (bur > 0.7 and not dive) and clamp(curSp * 0.35 + 2, 0, 90) or 0 end
+	if ride then lp.CameraMinZoomDistance = clamp(3.5 * R0, 12, 2900) end
+	if cut and act and act.name == "emerge" then cutsceneCamera(act, pf, dt) end
+	applyTargets()
+end
+
+-- GUI ----------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "SandWormGui"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 50
+gui.Parent = (gethui and gethui()) or lp:WaitForChild("PlayerGui")
+
+local GOLD, BG, BTN = Color3.fromRGB(222, 180, 110), Color3.fromRGB(24, 20, 16), Color3.fromRGB(58, 48, 38)
+local GREEN, RED = Color3.fromRGB(60, 120, 60), Color3.fromRGB(150, 50, 40)
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function round(o, r) mk("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+
+local FULL_H = math.min(420, math.max(220, cam.ViewportSize.Y - 40))
+local win = mk("Frame", {Size = UDim2.fromOffset(200, FULL_H), Position = UDim2.new(0, 46, 0.5, -FULL_H / 2),
+	BackgroundColor3 = BG, BorderSizePixel = 0, Active = true}, gui)
+round(win, 12)
+mk("UIStroke", {Color = GOLD, Thickness = 2}, win)
+local title = mk("TextLabel", {Size = UDim2.new(1, -56, 0, 26), Position = UDim2.fromOffset(8, 0), BackgroundTransparency = 1,
+	Text = "SAND WORM", TextColor3 = GOLD, Font = Enum.Font.GothamBold, TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left, Active = true}, win)
+local body = mk("ScrollingFrame", {Size = UDim2.new(1, -8, 1, -30), Position = UDim2.fromOffset(4, 28), BackgroundTransparency = 1,
+	BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new()}, win)
+
+local y = 0
+local function nextRow(h)
+	local r = mk("Frame", {Size = UDim2.new(1, -8, 0, h), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1}, body)
+	y += h + 6
+	return r
+end
+local function btn(r, text, x, wd, cb, color)
+	local b = mk("TextButton", {Size = UDim2.new(wd, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = color or BTN,
+		Text = text, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamMedium, TextSize = 11, TextWrapped = true}, r)
+	round(b)
+	b.Activated:Connect(function() cb(b) end)
+	return b
+end
+local function box(r, x, wd, placeholder, text)
+	local tb = mk("TextBox", {Size = UDim2.new(wd, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = BTN,
+		Text = text or "", PlaceholderText = placeholder, PlaceholderColor3 = Color3.fromRGB(150, 140, 125),
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamMedium, TextSize = 12, ClearTextOnFocus = false}, r)
+	round(tb)
+	return tb
+end
+
+local summonBtn, controlBtn, diveBtn, nameBox, sizeBox, bricksBox
+local cineGui
+local syncButtons = function() end
+
+local function toggleSummon()
+	if alive then
+		dismiss()
+	else
+		local n = tonumber(bricksBox.Text)
+		if n and n >= CFG.MinBricks then CFG.Want = math.floor(n) else CFG.Want = math.huge end
+		summon()
+	end
+	syncButtons()
+end
+local function setCalm()
+	if not alive then return end
+	hunt = nil
+	notify("Calm", 2)
+end
+local function toggleControl()
+	if not alive or (act and act.name == "emerge") then notify("Summon the worm first", 3) return end
+	control = not control
+	if control then hunt = nil end
+	notify(control and "CONTROL on - move with your normal controls, abilities on the buttons / R F G V" or "Control off", 4)
+	syncButtons()
+end
+local function toggleDive()
+	notify(control and "CONTROL on - move with your normal controls, abilities on the buttons / R F G V" or "Control off", 4)
+	syncButtons()
+end
+local function toggleDive()
+	if not alive then notify("Summon the worm first", 3) return end
+	dive = not dive
+	syncButtons()
+end
+local function typedPlayer(required)
+	local txt = nameBox.Text
+	if txt:match("^%s*$") then
+		if required then notify("Type a player name first", 3) end
+		return nil, false
+	end
+	local pl = findPlayer(txt)
+	if not pl then notify("Player not found: " .. txt, 3) return nil, true end
+	if not targetHrp(pl) then notify("That player has no character", 3) return nil, true end
+	return pl, false
+end
+local function huntTyped()
+	if not alive or (act and act.name == "emerge") then notify("Summon the worm first", 3) return end
+	if control then notify("Turn Control off first", 3) return end
+	local pl = typedPlayer(true)
+	if not pl then return end
+	hunt = {pl = pl}
+	notify("Hunting: " .. pl.DisplayName, 4)
+end
+local function doRoar() startAct("roar") end
+local function doLunge()
+	local pl, failed = typedPlayer(false)
+	if failed then return end
+	startAct("lunge", {pl = pl})
+end
+local function doSlam()
+	local pl, failed = typedPlayer(false)
+	if failed then return end
+	startAct("slam", {pl = pl})
+end
+local function applySize()
+	local n = parseSize(sizeBox.Text)
+	if not n then
+		notify("Type a size like 10x", 3)
+		sizeBox.Text = string.format("%gx", CFG.Size)
+		return
+	end
+	CFG.Size = n
+	sizeBox.Text = string.format("%gx", n)
+	if alive then
+		allocate()
+		applyColors()
+	end
+	notify(string.format("Size %gx", n), 3)
+end
+
+do
+	local r = nextRow(30)
+	summonBtn = btn(r, "Summon", 0, 1, toggleSummon, GREEN)
+	nameBox = box(nextRow(24), 0, 1, "Type player name")
+	btn(nextRow(28), "Hunt player", 0, 1, huntTyped, Color3.fromRGB(150, 40, 30))
+	local r4 = nextRow(28)
+	btn(r4, "Calm", 0, 0.5, setCalm, Color3.fromRGB(50, 90, 120))
+	controlBtn = btn(r4, "Control: OFF", 0.5, 0.5, toggleControl)
+	local rs = nextRow(24)
+	mk("TextLabel", {Size = UDim2.new(0.34, 0, 1, 0), BackgroundTransparency = 1, Text = "Size", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, rs)
+	sizeBox = box(rs, 0.34, 0.66, "10x, 50x...", string.format("%gx", CFG.Size))
+	sizeBox.FocusLost:Connect(applySize)
+	local rb = nextRow(24)
+	mk("TextLabel", {Size = UDim2.new(0.34, 0, 1, 0), BackgroundTransparency = 1, Text = "Bricks", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, rb)
+	bricksBox = box(rb, 0.34, 0.66, "blank = all")
+	local rl = nextRow(16)
+	mk("TextLabel", {Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "Abilities", TextColor3 = GOLD,
+		Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, rl)
+	local a1 = nextRow(28)
+	btn(a1, "Roar", 0, 0.5, doRoar)
+	btn(a1, "Lunge", 0.5, 0.5, doLunge)
+	local a2 = nextRow(28)
+	btn(a2, "Slam", 0, 0.5, doSlam)
+	diveBtn = btn(a2, "Dive: OFF", 0.5, 0.5, toggleDive)
+	btn(nextRow(24), "Unload script", 0, 1, function() if _G.SandWormScript then _G.SandWormScript() end end, RED)
+end
+statusLbl = mk("TextLabel", {Size = UDim2.new(1, -8, 0, 54), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1,
+	Text = "", TextColor3 = Color3.fromRGB(190, 175, 150), Font = Enum.Font.Gotham, TextSize = 10, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, body)
+body.CanvasSize = UDim2.fromOffset(0, y + 62)
+
+syncButtons = function()
+	summonBtn.Text = alive and "✖ Dismiss" or "Summon"
+	summonBtn.BackgroundColor3 = alive and RED or GREEN
+	controlBtn.Text = "Control: " .. (control and "ON" or "OFF")
+	controlBtn.BackgroundColor3 = control and GREEN or BTN
+	diveBtn.Text = "Dive: " .. (dive and "ON" or "OFF")
+	diveBtn.BackgroundColor3 = dive and GREEN or BTN
+end
+
+local function unload()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	dismiss()
+	gui:Destroy()
+	if cineGui then cineGui:Destroy() end
+	_G.SandWormScript = nil
+end
+_G.SandWormScript = unload
+
+local function headerBtn(text, x, cb)
+	local b = mk("TextButton", {Size = UDim2.fromOffset(22, 20), Position = UDim2.new(1, x, 0, 3), BackgroundColor3 = BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14}, win)
+	round(b, 6)
+	b.Activated:Connect(cb)
+end
+local minimized = false
+headerBtn("–", -48, function()
+	minimized = not minimized
+	body.Visible = not minimized
+	win.Size = UDim2.fromOffset(200, minimized and 26 or FULL_H)
+end)
+headerBtn("✕", -25, function() win.Visible = false end)
+
+local openBtn = mk("TextButton", {Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 6, 0.5, -17), BackgroundColor3 = BG,
+	Text = "🪱", TextColor3 = GOLD, Font = Enum.Font.GothamBold, TextSize = 16, ZIndex = 5}, gui)
+round(openBtn, 17)
+mk("UIStroke", {Color = GOLD, Thickness = 2}, openBtn)
+openBtn.Activated:Connect(function() win.Visible = not win.Visible end)
+
+-- cutscene GUI: letterbox bars, title card, skip button -------------------------------------------
+local TweenService = game:GetService("TweenService")
+cineGui = Instance.new("ScreenGui")
+cineGui.Name = "SandWormCine"
+cineGui.ResetOnSpawn = false
+cineGui.IgnoreGuiInset = true
+cineGui.DisplayOrder = 60
+cineGui.Parent = gui.Parent
+local barTop = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, cineGui)
+local barBot = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, cineGui)
+local titleLbl = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 44), Position = UDim2.new(0, 0, 0.7, 0), BackgroundTransparency = 1,
+	Text = "GIANT SAND WORM", TextColor3 = Color3.fromRGB(236, 200, 140), Font = Enum.Font.GothamBlack, TextSize = 32,
+	TextTransparency = 1, TextStrokeTransparency = 1, Visible = false, ZIndex = 12}, cineGui)
+local subLbl = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 20), Position = UDim2.new(0.0, 0, 0.7, 46), BackgroundTransparency = 1,
+	Text = "THE DEVOURER BENEATH THE DUNES", TextColor3 = Color3.fromRGB(220, 205, 175), Font = Enum.Font.GothamMedium, TextSize = 14,
+	TextTransparency = 1, TextStrokeTransparency = 1, Visible = false, ZIndex = 12}, cineGui)
+local skipBtn = mk("TextButton", {Size = UDim2.fromOffset(92, 30), AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35, Text = "Skip ▶▶", TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamMedium, TextSize = 12, Visible = false, ZIndex = 20}, cineGui)
+round(skipBtn, 8)
+skipBtn.Activated:Connect(function() if act and act.name == "emerge" then act.t = act.dur end end)
+local cutToken, winWas = 0, true
+local function fade(lbl, to, secs)
+	TweenService:Create(lbl, TweenInfo.new(secs, Enum.EasingStyle.Quad),
+		{TextTransparency = to, TextStrokeTransparency = (to >= 1) and 1 or 0.4}):Play()
+end
+cutHooks.begin = function()
+	cutToken += 1
+	local tok = cutToken
+	winWas = win.Visible
+	win.Visible, openBtn.Visible = false, false
+	barTop.Visible, barBot.Visible, skipBtn.Visible = true, true, true
+	barTop.Size, barBot.Size = UDim2.new(1, 0, 0, 0), UDim2.new(1, 0, 0, 0)
+	local ti = TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(barTop, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+	TweenService:Create(barBot, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+	task.delay(5.3, function()
+		if cutToken ~= tok then return end
+		titleLbl.Visible, subLbl.Visible = true, true
+		fade(titleLbl, 0, 0.8)
+		fade(subLbl, 0.2, 1.2)
+	end)
+	task.delay(8.2, function()
+		if cutToken ~= tok then return end
+		fade(titleLbl, 1, 0.9)
+		fade(subLbl, 1, 0.9)
+	end)
+end
+cutHooks.finish = function()
+	cutToken += 1
+	local tok = cutToken
+	fade(titleLbl, 1, 0.3)
+	fade(subLbl, 1, 0.3)
+	skipBtn.Visible = false
+	local ti = TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(barTop, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	TweenService:Create(barBot, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	win.Visible, openBtn.Visible = winWas, true
+	task.delay(0.8, function()
+		if cutToken ~= tok then return end
+		barTop.Visible, barBot.Visible, titleLbl.Visible, subLbl.Visible = false, false, false, false
+	end)
+end
+
+do -- drag by title
+	local dragging, startPos, startIn
+	title.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startIn = true, win.Position, i.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local dd = i.Position - startIn
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + dd.X, startPos.Y.Scale, startPos.Y.Offset + dd.Y)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end))
+end
+
+-- input / loop -------------------------------------------------------------
+table.insert(conns, UIS.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	local k = i.KeyCode
+	if k == Enum.KeyCode.RightControl then win.Visible = not win.Visible
+	elseif k == Enum.KeyCode.R then doRoar()
+	elseif k == Enum.KeyCode.F then doLunge()
+	elseif k == Enum.KeyCode.G then doSlam()
+	elseif k == Enum.KeyCode.V then toggleDive() end
+end))
+table.insert(conns, lp.CharacterAdded:Connect(function(c)
+	refChar(c)
+	if alive then
+		refreshFilters()
+		if ride then carryAvatar(true); cam.CameraSubject = camPart end
+	end
+end))
+
+local statT, filT = 0, 0
+table.insert(conns, RunService.RenderStepped:Connect(function(dt)
+	if alive then
+		local ok, err = pcall(function()
+			checkDrift()
+			if camPart then step(math.min(dt, 0.033)) end
+		end)
+		if not ok then
+			errT += dt
+			if errT > 0.5 then
+				errT = 0
+				notify("⚠ script error: " .. tostring(err), 6)
+				warn("[SandWorm] " .. tostring(err))
+			end
+		end
+		filT += dt
+		if filT > 2 then filT = 0; refreshFilters() end
+	end
+	statT += dt
+	if statT > 0.5 then
+		statT = 0
+		syncButtons()
+		if os.clock() > noticeUntil then
+			if alive then
+				local owned, n = visibleCount()
+				local st = "Idle"
+				if act then st = act.name:upper()
+				elseif hunt then st = "Hunting " .. (hunt.pl.DisplayName or "?")
+				elseif control then st = "Controlled"
+				elseif dive then st = "Hidden" end
+				statusLbl.Text = string.format("%s • %d bricks • %d/%d visible to others%s", st, n, owned, n, owned < n * 0.8 and " ⚠" or " ✔")
+			else
+				statusLbl.Text = string.format("Ready • uses every brick you own (min %d) • type a size like 10x", CFG.MinBricks)
+			end
+		end
+	end
+end))
+table.insert(conns, RunService.Heartbeat:Connect(function() if alive then applyTargets() end end))
+table.insert(conns, RunService.Stepped:Connect(function() if alive and #pool <= 1500 then applyTargets() end end))
+
+print("[SAND WORM] loaded - nothing moves until you press Summon")
